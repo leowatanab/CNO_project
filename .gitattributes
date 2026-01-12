@@ -1,0 +1,4 @@
+tmp_csvs/*.csv filter=lfs diff=lfs merge=lfs -text
+cno.duckdb filter=lfs diff=lfs merge=lfs -text
+*.csv filter=lfs diff=lfs merge=lfs -text
+*.duckdb filter=lfs diff=lfs merge=lfs -text

@@ -1,0 +1,8 @@
+# CSVs grandes gerados
+tmp_csvs/
+
+# Banco DuckDB
+*.duckdb
+
+# CSVs grandes específicos (opcional)
+*.csv
