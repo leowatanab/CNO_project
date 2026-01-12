@@ -43,7 +43,7 @@ with zipfile.ZipFile(zip_bytes) as z:
         # Ler CSV com Pandas, ignorando linhas inválidas
         df = pd.read_csv(
             tmp_path,
-            sep=';',
+            sep=',',
             dtype=str,
             encoding='latin1',
             on_bad_lines='skip'
