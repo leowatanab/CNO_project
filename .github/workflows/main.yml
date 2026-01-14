@@ -1,0 +1,27 @@
+name: refresh_data
+
+on:
+  schedule:
+    - cron: '0 6 1 * *'   # todo dia 1 às 03h (Brasil)
+  workflow_dispatch:
+
+jobs:
+  run-python:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download script
+        uses: actions/checkout@v4
+
+      - name: Set Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: Run script
+        env:
+          MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
+        run: python main.py
