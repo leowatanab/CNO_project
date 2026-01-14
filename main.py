@@ -6,7 +6,6 @@ import io
 import os
 from tqdm import tqdm
 from pathlib import Path
-#import streamlit as st
 
 DB_PATH = Path(__file__).parent / "cno.duckdb"
 

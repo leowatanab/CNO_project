@@ -1,6 +1,8 @@
-streamlit
 pandas
 duckdb
-folium
-streamlit-folium
-openlocationcode
+requests
+zipfile
+io
+os
+tqdm
+pathlib
