@@ -2,7 +2,7 @@ name: refresh_data
 
 on:
   schedule:
-    - cron: '0 6 1 * *'   # todo dia 1 às 03h (Brasil)
+    - cron: '0 6 * * 1'
   workflow_dispatch:
 
 jobs:
@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download script
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set Python
