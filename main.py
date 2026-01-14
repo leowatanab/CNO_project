@@ -12,7 +12,7 @@ DB_PATH = Path(__file__).parent / "cno.duckdb"
 
 #@st.cache_resource
 def get_connection():
-    return duckdb.connect(database=str(DB_PATH), read_only=True)
+    return duckdb.connect(database=str(DB_PATH), read_only=False)
 
 def extract_data():
     # URLs e paths
@@ -67,25 +67,43 @@ def extract_data():
 
     print("\n🎉 Todos os arquivos importados com sucesso!")
     con.close()
-    print("🔹 Conexão com DuckDB encerrada.")
+    print("🔹 Extração dos dados concluida.")
 
 def transform_data():
 
+    print("🔹 Começando o tratamento dos dados")
+
     # Query todas as tabelas em df
+    
+    print("➡️ Carregando tabelas do DuckDB...")
+
     con = get_connection()
+
     cno_area = con.execute(f"SELECT * FROM cno_areas").df()
     cno = con.execute(f"SELECT * FROM cno").df()
     cno_vinculos = con.execute(f"SELECT * FROM cno_vinculos").df()
     cno_cnaes = con.execute(f"SELECT * FROM cno_cnaes").df()
 
+    print("✅ Tabelas carregadas")
+
     # Em cno_areas, há dados repetidos
     # Pegar o CNO com o maior índice
+
+    print("➡️ Tratando dados duplicados...")
+
     cno_area = (
         cno_area
         .sort_index()
         .drop_duplicates(subset='CNO', keep='last')
     )
-    
+
+    cno_vinculos = (
+        cno_vinculos
+        .sort_index()
+        .drop_duplicates(subset='CNO', keep='last')
+    )
+    print("✅ Dados tratados")
+
     print(cno['CNO'].duplicated().any())
     print(cno_area['CNO'].duplicated().any())
     print(cno_vinculos['CNO'].duplicated().any())
@@ -93,7 +111,46 @@ def transform_data():
 
     # Agrupar cno e cno_area
     cno_base = cno.merge(cno_area, on='CNO', how='left', suffixes=('', '_area'))
-    print(f"CNO base shape: {cno_base.head()}")
+    cno_base = cno_base.merge(cno_vinculos, on='CNO', how='left', suffixes=('', '_vinculos'))
+    con.register("df_cno_base", cno_base)
 
-# extract_data()
+    con.execute("""
+        CREATE OR REPLACE TABLE cno_base AS
+        SELECT * FROM df_cno_base
+    """)
+    print("✅ Tabelas unidas e armazenadas em cno_base")
+
+def upload_data():
+    print("🔹 Iniciando o carregamento dos dados tratados para o MotherDuck")
+
+    md_token = os.getenv("MOTHERDUCK_TOKEN")
+    if not md_token:
+        raise ValueError("Token do MotherDuck não encontrado nas variáveis de ambiente")
+
+    # Conecta ao MotherDuck
+    con = duckdb.connect(f"md:?motherduck_token={md_token}")
+    print("✅ Conectado ao MotherDuck")
+
+    # Anexa o banco local
+    con.execute(f"""
+        ATTACH '{DB_PATH.as_posix()}' AS local;
+    """)
+    print("✅ Banco local anexado")
+
+    # (opcional) criar database no MotherDuck
+    con.execute("CREATE DATABASE IF NOT EXISTS cno")
+
+    # Copiar tabela
+    con.execute("""
+        CREATE OR REPLACE TABLE cno.cno_base AS
+        SELECT * FROM local.cno_base
+    """)
+
+    print("🎉 cno_base enviada com sucesso para o MotherDuck")
+
+    con.close()
+
+extract_data()
 transform_data()
+upload_data()
+
