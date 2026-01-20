@@ -75,7 +75,7 @@ df = df[df["Data de início"] >= (pd.Timestamp.now() - pd.Timedelta(days=100))]
 # Display dataframe
 st.title("🏗️ Obras Novas Residenciais Multifamiliares - Últimos 7 dias")
 
-st.dataframe(df)
+st.dataframe(df, width='content')
 
 st.write(f"Total de obras encontradas: {len(df)}")
 

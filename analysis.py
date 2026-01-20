@@ -92,7 +92,7 @@ SELECT
     "Nome empresarial", 
     Metragem
 FROM cno.cno_base
-WHERE "Data de registro" > '2020-01-01'
+WHERE "Data de registro" > '2025-01-01'
   AND Categoria = 'Obra Nova'
   AND Destinação = 'Residencial multifamiliar'
   AND Situação = '02'
@@ -255,6 +255,8 @@ hist_metragem = (
     )
 )
 
+# Show dataframe
+st.altair_chart(hist_metragem, use_container_width=True)
 
 # =====================================================
 # DETALHAMENTO MUNICÍPIO
