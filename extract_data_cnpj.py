@@ -13,10 +13,11 @@ from datetime import datetime
 # =====================================================
 # CONFIGURAÇÕES
 # =====================================================
-SLEEP_SECONDS = 0.6          # ~1,6 requisições/seg (seguro)
+SLEEP_SECONDS = 0.6
 MAX_TENTATIVAS = 5
-LOG_INTERVAL = 100          # log a cada 100 CNPJs
-TABLE_DESTINO = "cno.cnpj_enriquecido"
+BATCH_SIZE = 100
+LOG_INTERVAL = 100
+TABLE_DESTINO = "cno.cnpj_cadastral"
 
 
 # =====================================================
@@ -31,20 +32,21 @@ def get_md_connection():
 
 
 # =====================================================
-# PADRONIZAR CNPJ
+# UTILIDADES
 # =====================================================
 def padronizar_cnpj(cnpj):
     return re.sub(r"\D", "", str(cnpj)).zfill(14)
 
 
+def clean_digits(v):
+    return re.sub(r"\D", "", v) if v else None
+
+
 # =====================================================
-# CONSULTA BRASILAPI (COM RETRY + BACKOFF)
+# CONSULTA BRASILAPI (RETRY + BACKOFF)
 # =====================================================
 def get_cnpj_info(cnpj):
-    tentativa = 0
-
-    while tentativa < MAX_TENTATIVAS:
-        tentativa += 1
+    for tentativa in range(1, MAX_TENTATIVAS + 1):
         try:
             r = requests.get(
                 f"https://brasilapi.com.br/api/cnpj/v1/{cnpj}",
@@ -66,126 +68,128 @@ def get_cnpj_info(cnpj):
 
 
 # =====================================================
-# PROCESSAR CNPJ
-# =====================================================
-def processar_cnpj(cnpj):
-    info = get_cnpj_info(cnpj)
-    linhas = []
-
-    if not info:
-        return linhas
-
-    base = {
-        "cnpj": cnpj,
-        "razao_social": info.get("razao_social"),
-        "logradouro": info.get("logradouro"),
-        "municipio": info.get("municipio"),
-        "uf": info.get("uf"),
-        "cep": info.get("cep"),
-        "situacao_cadastral": info.get("descricao_situacao_cadastral"),
-        "tipo_estabelecimento": info.get("descricao_identificador_matriz_filial"),
-        "email": info.get("email"),
-        "telefone_1": info.get("ddd_telefone_1"),
-        "telefone_2": info.get("ddd_telefone_2"),
-        "data_consulta": datetime.utcnow()
-    }
-
-    # CNAE principal
-    linhas.append({
-        **base,
-        "cnae": info.get("cnae_fiscal"),
-        "descricao_cnae": info.get("cnae_fiscal_descricao")
-    })
-
-    # CNAEs secundários
-    for cnae in info.get("cnaes_secundarios", []):
-        linhas.append({
-            **base,
-            "cnae": cnae.get("codigo"),
-            "descricao_cnae": cnae.get("descricao")
-        })
-
-    return linhas
-
-
-# =====================================================
-# CRIAR TABELA DESTINO (SE NÃO EXISTIR)
+# CRIAR TABELA DESTINO
 # =====================================================
 def criar_tabela_destino(con):
     con.execute(f"""
         CREATE TABLE IF NOT EXISTS {TABLE_DESTINO} (
             cnpj VARCHAR,
             razao_social VARCHAR,
+            nome_fantasia VARCHAR,
             logradouro VARCHAR,
+            numero VARCHAR,
+            bairro VARCHAR,
             municipio VARCHAR,
             uf VARCHAR,
             cep VARCHAR,
             situacao_cadastral VARCHAR,
             tipo_estabelecimento VARCHAR,
+            porte VARCHAR,
+            natureza_juridica VARCHAR,
             email VARCHAR,
             telefone_1 VARCHAR,
             telefone_2 VARCHAR,
-            cnae VARCHAR,
-            descricao_cnae VARCHAR,
-            data_consulta TIMESTAMP
+            data_abertura DATE,
+            data_consulta TIMESTAMP,
+            status_consulta VARCHAR
         )
     """)
-    print("✅ Tabela destino verificada/criada")
+
+    con.execute(f"""
+        CREATE INDEX IF NOT EXISTS idx_cnpj_cadastral_cnpj
+        ON {TABLE_DESTINO}(cnpj)
+    """)
+
+    print("✅ Tabela cnpj_cadastral pronta")
+
+
+# =====================================================
+# PROCESSAR CNPJ (1 LINHA)
+# =====================================================
+def processar_cnpj(cnpj):
+    info = get_cnpj_info(cnpj)
+
+    if not info:
+        return {
+            "cnpj": cnpj,
+            "data_consulta": datetime.utcnow(),
+            "status_consulta": "erro_api"
+        }
+
+    return {
+        "cnpj": cnpj,
+        "razao_social": info.get("razao_social"),
+        "nome_fantasia": info.get("nome_fantasia"),
+        "logradouro": info.get("logradouro"),
+        "numero": info.get("numero"),
+        "bairro": info.get("bairro"),
+        "municipio": info.get("municipio"),
+        "uf": info.get("uf"),
+        "cep": clean_digits(info.get("cep")),
+        "situacao_cadastral": info.get("descricao_situacao_cadastral"),
+        "tipo_estabelecimento": info.get("descricao_identificador_matriz_filial"),
+        "porte": info.get("porte"),
+        "natureza_juridica": info.get("natureza_juridica"),
+        "email": info.get("email"),
+        "telefone_1": clean_digits(info.get("ddd_telefone_1")),
+        "telefone_2": clean_digits(info.get("ddd_telefone_2")),
+        "data_abertura": info.get("data_inicio_atividade"),
+        "data_consulta": datetime.utcnow(),
+        "status_consulta": "ok"
+    }
 
 
 # =====================================================
 # MAIN
 # =====================================================
 def main():
-    print("🚀 Iniciando enriquecimento de CNPJs")
+    print("🚀 Iniciando enriquecimento cadastral de CNPJs")
 
     con = get_md_connection()
     criar_tabela_destino(con)
 
     # -------------------------------------------------
-    # BUSCA CNPJs ORIGEM
+    # BUSCAR SOMENTE CNPJs AINDA NÃO PROCESSADOS
     # -------------------------------------------------
-    df_origem = con.execute("""
-        SELECT DISTINCT "NI do responsável"
+    df_origem = con.execute(f"""
+        SELECT DISTINCT
+            regexp_replace("NI do responsável", '\\D', '', 'g') AS cnpj
         FROM cno.cno_vinculos
         WHERE "NI do responsável" IS NOT NULL
+          AND regexp_replace("NI do responsável", '\\D', '', 'g') NOT IN (
+              SELECT cnpj FROM {TABLE_DESTINO}
+          )
     """).df()
 
-    cnpjs = (
-        df_origem["NI do responsável"]
-        .apply(padronizar_cnpj)
-        .unique()
-        .tolist()
-    )
-
+    cnpjs = df_origem["cnpj"].dropna().unique().tolist()
     total = len(cnpjs)
-    print(f"🔎 {total} CNPJs únicos encontrados")
+
+    print(f"🔎 {total} CNPJs novos encontrados")
 
     buffer = []
-    processados = 0
 
     # -------------------------------------------------
     # LOOP PRINCIPAL
     # -------------------------------------------------
-    for cnpj in cnpjs:
-        linhas = processar_cnpj(cnpj)
-        buffer.extend(linhas)
+    for i, cnpj in enumerate(cnpjs, start=1):
+        cnpj = padronizar_cnpj(cnpj)
+        row = processar_cnpj(cnpj)
+        buffer.append(row)
 
-        processados += 1
-
-        # INSERT EM BATCH (a cada 100)
-        if len(buffer) >= 100:
+        if len(buffer) >= BATCH_SIZE:
             df_insert = pd.DataFrame(buffer)
             con.register("df_tmp", df_insert)
             con.execute(f"INSERT INTO {TABLE_DESTINO} SELECT * FROM df_tmp")
             buffer.clear()
 
-        if processados % LOG_INTERVAL == 0:
-            print(f"⏳ {processados}/{total} CNPJs processados")
+        if i % LOG_INTERVAL == 0:
+            print(f"⏳ {i}/{total} CNPJs processados")
 
         time.sleep(SLEEP_SECONDS)
 
+    # -------------------------------------------------
     # INSERT FINAL
+    # -------------------------------------------------
     if buffer:
         df_insert = pd.DataFrame(buffer)
         con.register("df_tmp", df_insert)
