@@ -50,12 +50,11 @@ jobs:
       # --------------------------------------------
       # EXECUTAR SCRIPT
       # --------------------------------------------
-      - name: Executar enriquecimento de CNPJs
+      - name: Executar consulta CNPJs
         run: |
-          echo "🚀 Iniciando enriquecimento cadastral"
-          python consulta_cnpj.py
+          echo "🚀 Iniciando Consulta CNPJs"
+          python -u consulta_cnpj.py
           echo "✅ Finalizado"
-
       # --------------------------------------------
       # LOG EM CASO DE FALHA
       # --------------------------------------------
