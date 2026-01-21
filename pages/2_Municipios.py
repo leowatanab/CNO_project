@@ -22,4 +22,4 @@ tabela_municipios = tabela_municipios.rename(
     }
 )
 
-st.dataframe(tabela_municipios, width= 800)
+st.dataframe(tabela_municipios, width= 800, height=700)

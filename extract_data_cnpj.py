@@ -1,6 +1,3 @@
-# =====================================================
-# IMPORTS
-# =====================================================
 import duckdb
 import pandas as pd
 import os
@@ -8,6 +5,7 @@ import re
 import requests
 import time
 from datetime import datetime
+from datetime import date
 
 
 # =====================================================
@@ -57,14 +55,17 @@ def get_cnpj_info(cnpj):
                 return r.json()
 
             if r.status_code == 404:
-                return None
+                return {"_status": "cnpj_nao_encontrado"}
 
             time.sleep(min(tentativa * 2, 10))
+
+        except requests.exceptions.Timeout:
+            return {"_status": "timeout"}
 
         except requests.exceptions.RequestException:
             time.sleep(min(tentativa * 2, 10))
 
-    return None
+    return {"_status": "erro_api"}
 
 
 # =====================================================
@@ -96,7 +97,7 @@ def criar_tabela_destino(con):
     """)
 
     con.execute(f"""
-        CREATE INDEX IF NOT EXISTS idx_cnpj_cadastral_cnpj
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_cnpj_cadastral_cnpj
         ON {TABLE_DESTINO}(cnpj)
     """)
 
@@ -104,16 +105,16 @@ def criar_tabela_destino(con):
 
 
 # =====================================================
-# PROCESSAR CNPJ (1 LINHA)
+# PROCESSAR CNPJ
 # =====================================================
 def processar_cnpj(cnpj):
     info = get_cnpj_info(cnpj)
 
-    if not info:
+    if "_status" in info:
         return {
             "cnpj": cnpj,
             "data_consulta": datetime.utcnow(),
-            "status_consulta": "erro_api"
+            "status_consulta": info["_status"]
         }
 
     return {
@@ -133,7 +134,11 @@ def processar_cnpj(cnpj):
         "email": info.get("email"),
         "telefone_1": clean_digits(info.get("ddd_telefone_1")),
         "telefone_2": clean_digits(info.get("ddd_telefone_2")),
-        "data_abertura": info.get("data_inicio_atividade"),
+        "data_abertura": (
+            datetime.strptime(info.get("data_inicio_atividade"), "%Y-%m-%d").date()
+            if info.get("data_inicio_atividade")
+            else None
+        ),
         "data_consulta": datetime.utcnow(),
         "status_consulta": "ok"
     }
@@ -148,9 +153,6 @@ def main():
     con = get_md_connection()
     criar_tabela_destino(con)
 
-    # -------------------------------------------------
-    # BUSCAR SOMENTE CNPJs AINDA NÃO PROCESSADOS
-    # -------------------------------------------------
     df_origem = con.execute(f"""
         SELECT DISTINCT
             regexp_replace("NI do responsável", '\\D', '', 'g') AS cnpj
@@ -168,39 +170,5 @@ def main():
 
     buffer = []
 
-    # -------------------------------------------------
-    # LOOP PRINCIPAL
-    # -------------------------------------------------
     for i, cnpj in enumerate(cnpjs, start=1):
-        cnpj = padronizar_cnpj(cnpj)
-        row = processar_cnpj(cnpj)
-        buffer.append(row)
-
-        if len(buffer) >= BATCH_SIZE:
-            df_insert = pd.DataFrame(buffer)
-            con.register("df_tmp", df_insert)
-            con.execute(f"INSERT INTO {TABLE_DESTINO} SELECT * FROM df_tmp")
-            buffer.clear()
-
-        if i % LOG_INTERVAL == 0:
-            print(f"⏳ {i}/{total} CNPJs processados")
-
-        time.sleep(SLEEP_SECONDS)
-
-    # -------------------------------------------------
-    # INSERT FINAL
-    # -------------------------------------------------
-    if buffer:
-        df_insert = pd.DataFrame(buffer)
-        con.register("df_tmp", df_insert)
-        con.execute(f"INSERT INTO {TABLE_DESTINO} SELECT * FROM df_tmp")
-
-    con.close()
-    print("✅ Processo finalizado com sucesso")
-
-
-# =====================================================
-# ENTRYPOINT
-# =====================================================
-if __name__ == "__main__":
-    main()
+        row = processar_cnpj(padronizar_cnpj
