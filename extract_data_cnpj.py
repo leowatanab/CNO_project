@@ -171,4 +171,26 @@ def main():
     buffer = []
 
     for i, cnpj in enumerate(cnpjs, start=1):
-        row = processar_cnpj(padronizar_cnpj
+        row = processar_cnpj(padronizar_cnpj(cnpj))
+        buffer.append(row)
+
+        if len(buffer) >= BATCH_SIZE:
+            con.register("df_tmp", pd.DataFrame(buffer))
+            con.execute(f"INSERT OR IGNORE INTO {TABLE_DESTINO} SELECT * FROM df_tmp")
+            buffer.clear()
+
+        if i % LOG_INTERVAL == 0:
+            print(f"⏳ {i}/{total} CNPJs processados")
+
+        time.sleep(SLEEP_SECONDS)
+
+    if buffer:
+        con.register("df_tmp", pd.DataFrame(buffer))
+        con.execute(f"INSERT OR IGNORE INTO {TABLE_DESTINO} SELECT * FROM df_tmp")
+
+    con.close()
+    print("✅ Processo finalizado com sucesso")
+
+
+if __name__ == "__main__":
+    main()
