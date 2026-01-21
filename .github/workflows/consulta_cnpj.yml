@@ -53,7 +53,7 @@ jobs:
       - name: Executar enriquecimento de CNPJs
         run: |
           echo "🚀 Iniciando enriquecimento cadastral"
-          python enriquecer_cnpj.py
+          python consulta_cnpj.py
           echo "✅ Finalizado"
 
       # --------------------------------------------
