@@ -2,7 +2,7 @@ name: refresh_data
 
 on:
   schedule:
-    - cron: '0 6 * * *'   # roda diariamente às 06:00 UTC
+    - cron: '0 6 * * *'
   workflow_dispatch:
 
 jobs:
@@ -18,39 +18,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Upgrade pip and purge cache
-        run: |
-          python -m pip install --upgrade pip
-          pip cache purge || true
-
-      # (Opcional) Se você usa cache, inclua a versão no key para evitar drift.
-      # - uses: actions/cache@v4
-      #   with:
-      #     path: ~/.cache/pip
-      #     key: pip-${{ runner.os }}-py311-duckdb-1.4.3-${{ hashFiles('requirements.txt') }}
-
-      - name: Install requirements (no cache)
-        run: |
-          pip install --no-cache-dir -r requirements.txt
-          echo "Pacotes instalados:"
-          python -m pip show duckdb || true
-          python - <<'PY'
-import duckdb, sys
-print("DuckDB version:", duckdb.__version__)
-assert duckdb.__version__ == "1.4.3", f"DuckDB não está 1.4.3! Está {duckdb.__version__}"
-PY
-
-      - name: Prepare clean DuckDB extensions dir
-        run: |
-          # remove extensões baixadas previamente de outra versão (se existirem)
-          rm -rf ~/.duckdb/extensions/v1.4.4 || true
-          # cria um diretório temporário/isolado para extensões desta execução
-          mkdir -p "$RUNNER_TEMP/duckdb_extensions"
-          echo "DUCKDB_EXTENSION_DIRECTORY=$RUNNER_TEMP/duckdb_extensions" >> $GITHUB_ENV
+      - name: Install requirements
+        run: pip install -r requirements.txt
 
       - name: Run script
         env:
           MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
-        run: |
-          python -m pip show duckdb
-          python main.py
+        run: python main.py
