@@ -1,4 +1,4 @@
 pandas
-duckdb
+duckdb==1.4.3
 requests
 tqdm
