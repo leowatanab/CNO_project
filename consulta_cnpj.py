@@ -4,8 +4,7 @@ import os
 import re
 import requests
 import time
-from datetime import datetime
-from datetime import date
+from datetime import datetime, timedelta
 
 
 # =====================================================
@@ -15,7 +14,10 @@ SLEEP_SECONDS = 0.6
 MAX_TENTATIVAS = 5
 BATCH_SIZE = 100
 LOG_INTERVAL = 100
+RETRY_DAYS = 7
+
 TABLE_DESTINO = "cno.cnpj_cadastral"
+TABLE_ORIGEM = "cno.cno_vinculos"
 
 
 # =====================================================
@@ -41,12 +43,19 @@ def clean_digits(v):
 
 
 # =====================================================
+# HTTP SESSION (PERFORMANCE)
+# =====================================================
+session = requests.Session()
+session.headers.update({"User-Agent": "cnpj-enrichment/1.0"})
+
+
+# =====================================================
 # CONSULTA BRASILAPI (RETRY + BACKOFF)
 # =====================================================
 def get_cnpj_info(cnpj):
     for tentativa in range(1, MAX_TENTATIVAS + 1):
         try:
-            r = requests.get(
+            r = session.get(
                 f"https://brasilapi.com.br/api/cnpj/v1/{cnpj}",
                 timeout=10
             )
@@ -57,13 +66,17 @@ def get_cnpj_info(cnpj):
             if r.status_code == 404:
                 return {"_status": "cnpj_nao_encontrado"}
 
+            if r.status_code == 429:
+                time.sleep(10)
+                continue
+
             time.sleep(min(tentativa * 2, 10))
 
         except requests.exceptions.Timeout:
             return {"_status": "timeout"}
 
-        except requests.exceptions.RequestException:
-            time.sleep(min(tentativa * 2, 10))
+        except requests.exceptions.RequestException as e:
+            return {"_status": f"erro_api: {str(e)[:100]}"}
 
     return {"_status": "erro_api"}
 
@@ -101,7 +114,30 @@ def criar_tabela_destino(con):
         ON {TABLE_DESTINO}(cnpj)
     """)
 
-    print("✅ Tabela cnpj_cadastral pronta")
+    print("✅ Tabela destino pronta")
+
+
+# =====================================================
+# QUERY INCREMENTAL
+# =====================================================
+def buscar_cnpjs_incrementais(con) -> list[str]:
+    df = con.execute(f"""
+        SELECT DISTINCT
+            regexp_replace(o."NI do responsável", '\\D', '', 'g') AS cnpj
+        FROM {TABLE_ORIGEM} o
+        LEFT JOIN {TABLE_DESTINO} d
+          ON regexp_replace(o."NI do responsável", '\\D', '', 'g') = d.cnpj
+        WHERE o."NI do responsável" IS NOT NULL
+          AND (
+                d.cnpj IS NULL
+             OR (
+                    d.status_consulta IN ('timeout', 'erro_api')
+                AND d.data_consulta < CURRENT_DATE - INTERVAL {RETRY_DAYS} DAY
+             )
+          )
+    """).df()
+
+    return df["cnpj"].dropna().unique().tolist()
 
 
 # =====================================================
@@ -148,25 +184,15 @@ def processar_cnpj(cnpj):
 # MAIN
 # =====================================================
 def main():
-    print("🚀 Iniciando enriquecimento cadastral de CNPJs")
+    print("🚀 Job incremental de enriquecimento de CNPJ iniciado")
 
     con = get_md_connection()
     criar_tabela_destino(con)
 
-    df_origem = con.execute(f"""
-        SELECT DISTINCT
-            regexp_replace("NI do responsável", '\\D', '', 'g') AS cnpj
-        FROM cno.cno_vinculos
-        WHERE "NI do responsável" IS NOT NULL
-          AND regexp_replace("NI do responsável", '\\D', '', 'g') NOT IN (
-              SELECT cnpj FROM {TABLE_DESTINO}
-          )
-    """).df()
-
-    cnpjs = df_origem["cnpj"].dropna().unique().tolist()
+    cnpjs = buscar_cnpjs_incrementais(con)
     total = len(cnpjs)
 
-    print(f"🔎 {total} CNPJs novos encontrados")
+    print(f"🔎 {total} CNPJs pendentes para processamento")
 
     buffer = []
 
@@ -176,7 +202,20 @@ def main():
 
         if len(buffer) >= BATCH_SIZE:
             con.register("df_tmp", pd.DataFrame(buffer))
-            con.execute(f"INSERT OR IGNORE INTO {TABLE_DESTINO} SELECT * FROM df_tmp")
+            con.execute(f"""
+                INSERT OR IGNORE INTO {TABLE_DESTINO} (
+                    cnpj, razao_social, nome_fantasia, logradouro, numero, bairro,
+                    municipio, uf, cep, situacao_cadastral, tipo_estabelecimento,
+                    porte, natureza_juridica, email, telefone_1, telefone_2,
+                    data_abertura, data_consulta, status_consulta
+                )
+                SELECT
+                    cnpj, razao_social, nome_fantasia, logradouro, numero, bairro,
+                    municipio, uf, cep, situacao_cadastral, tipo_estabelecimento,
+                    porte, natureza_juridica, email, telefone_1, telefone_2,
+                    data_abertura, data_consulta, status_consulta
+                FROM df_tmp
+            """)
             buffer.clear()
 
         if i % LOG_INTERVAL == 0:
@@ -186,10 +225,13 @@ def main():
 
     if buffer:
         con.register("df_tmp", pd.DataFrame(buffer))
-        con.execute(f"INSERT OR IGNORE INTO {TABLE_DESTINO} SELECT * FROM df_tmp")
+        con.execute("""
+            INSERT OR IGNORE INTO {TABLE_DESTINO}
+            SELECT * FROM df_tmp
+        """)
 
     con.close()
-    print("✅ Processo finalizado com sucesso")
+    print("✅ Job incremental finalizado com sucesso")
 
 
 if __name__ == "__main__":
