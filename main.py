@@ -2,154 +2,111 @@ import os
 import io
 import zipfile
 import tempfile
-import requests
-from requests.adapters import HTTPAdapter, Retry
-from tqdm import tqdm
 import shutil
-import duckdb
 import re
 import time
+import requests
+import duckdb
 import pandas as pd
 from datetime import datetime
+from requests.adapters import HTTPAdapter, Retry
+from tqdm import tqdm
 
-
-# Global settings
+# =====================================================
+# CONFIGURAÇÕES
+# =====================================================
 CNO_URL = "https://arquivos.receitafederal.gov.br/dados/cno/cno.zip"
+
+TABLE_DESTINO = "cnpj_cadastral"
 
 SLEEP_SECONDS = 0.6
 MAX_TENTATIVAS = 5
-BATCH_SIZE = 100
 LOG_INTERVAL = 100
-RETRY_DAYS = 7
+BATCH_SIZE = 200
 
-TABLE_CNPJ = "cnpj_cadastral"
-TABLE_ORIGEM_CNPJ = "cno_vinculos"
-
-
-# Connect to MotherDuck database
+# =====================================================
+# CONEXÃO MOTHERDUCK
+# =====================================================
 def get_md_connection():
     token = os.getenv("MOTHERDUCK_TOKEN")
     if not token:
         raise ValueError("❌ MOTHERDUCK_TOKEN não encontrado")
-    return duckdb.connect(f"md:?motherduck_token={token}")
 
+    con = duckdb.connect(f"md:cno?motherduck_token={token}")
+    con.execute("USE main")
+    return con
 
-# Utilities functions
 def qi(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
-
-def padronizar_cnpj(cnpj):
-    return re.sub(r"\D", "", str(cnpj)).zfill(14)
-
-
-def clean_digits(v):
-    return re.sub(r"\D", "", v) if v else None
-
-
-# Download with retries and progress bar
-def download_with_progress(url: str, dest_path: str):
-    session = requests.Session()
-    retries = Retry(
-        total=5,
-        backoff_factor=1,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "HEAD"]
-    )
-    session.mount("https://", HTTPAdapter(max_retries=retries))
-
-    total = None
-    try:
-        head = session.head(url, timeout=30)
-        if "Content-Length" in head.headers:
-            total = int(head.headers["Content-Length"])
-    except Exception:
-        pass
-
-    with session.get(url, stream=True, timeout=180) as r:
-        r.raise_for_status()
-        with open(dest_path, "wb") as f, tqdm(
-            total=total, unit="B", unit_scale=True, desc="Baixando CNO"
-        ) as pbar:
-            for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-                    if total:
-                        pbar.update(len(chunk))
-
-
-# Extract and load CNO data
-def extract_and_load_cno():
+# =====================================================
+# EXTRAÇÃO + CARGA INCREMENTAL DO CNO
+# =====================================================
+def extract_and_load_raw(threads: int = 8):
     workdir = tempfile.mkdtemp(prefix="cno_")
     zip_path = os.path.join(workdir, "cno.zip")
-    utf8_dir = os.path.join(workdir, "utf8")
-    os.makedirs(utf8_dir, exist_ok=True)
 
     try:
-        download_with_progress(CNO_URL, zip_path)
+        print("⬇️ Baixando CNO...")
+        r = requests.get(CNO_URL, stream=True, timeout=120)
+        r.raise_for_status()
+        with open(zip_path, "wb") as f:
+            for chunk in r.iter_content(4 * 1024 * 1024):
+                f.write(chunk)
+
+        con = get_md_connection()
+        con.execute("CREATE DATABASE IF NOT EXISTS cno")
+        con.execute("USE cno")
+        con.execute(f"PRAGMA threads={threads}")
 
         with zipfile.ZipFile(zip_path) as z:
-            csv_files = [f for f in z.namelist() if f.lower().endswith(".csv")]
+            for file in z.namelist():
+                if not file.lower().endswith(".csv"):
+                    continue
 
-            con = get_md_connection()
-            con.execute("CREATE DATABASE IF NOT EXISTS cno")
-            con.execute("USE cno")
-            con.execute("PRAGMA threads = 8")
-
-            for file in tqdm(csv_files, desc="Importando CSVs"):
-                table_name = (
-                    file.split("/")[-1]
-                        .replace(".csv", "")
-                        .replace("-", "_")
-                        .lower()
+                table = (
+                    os.path.basename(file)
+                    .replace(".csv", "")
+                    .replace("-", "_")
+                    .lower()
                 )
 
-                with z.open(file) as fpeek:
-                    head = fpeek.read(100_000)
+                print(f"📄 {file} → {table}")
 
-                encoding = "utf-8"
+                with z.open(file) as src:
+                    data = src.read()
+
                 try:
-                    head.decode("utf-8")
+                    data.decode("utf-8")
+                    encoding = "utf-8"
                 except UnicodeDecodeError:
                     encoding = "latin-1"
 
-                out_path = os.path.join(utf8_dir, os.path.basename(file))
+                csv_path = os.path.join(workdir, file)
+                os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+
                 if encoding == "utf-8":
-                    with z.open(file) as src, open(out_path, "wb") as dst:
-                        shutil.copyfileobj(src, dst)
+                    with open(csv_path, "wb") as f:
+                        f.write(data)
                 else:
-                    with z.open(file) as src, \
-                         io.TextIOWrapper(src, encoding="latin-1", errors="replace") as txt, \
-                         open(out_path, "w", encoding="utf-8") as dst:
-                        shutil.copyfileobj(txt, dst)
+                    with open(csv_path, "w", encoding="utf-8") as f:
+                        f.write(data.decode("latin-1", errors="replace"))
 
-                staging = f"{table_name}__staging"
-                con.execute(f"DROP TABLE IF EXISTS {qi(staging)}")
                 con.execute(f"""
-                    CREATE TEMP TABLE {qi(staging)} AS
+                    CREATE TABLE IF NOT EXISTS {qi(table)} AS
                     SELECT *
-                    FROM read_csv_auto(?, HEADER=TRUE, ALL_VARCHAR=TRUE);
-                """, [out_path])
+                    FROM read_csv_auto('{csv_path}', ALL_VARCHAR=TRUE)
+                """)
 
-                if not con.execute(
-                    "SELECT 1 FROM information_schema.tables WHERE table_name=?",
-                    [table_name]
-                ).fetchone():
-                    con.execute(f"CREATE TABLE {qi(table_name)} AS SELECT * FROM {qi(staging)}")
-                else:
-                    con.execute(f"""
-                        INSERT INTO {qi(table_name)}
-                        SELECT * FROM {qi(staging)}
-                        EXCEPT
-                        SELECT * FROM {qi(table_name)}
-                    """)
+        con.close()
+        print("✅ CNO carregado")
 
-            con.close()
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
-
-# Transform data, creating cno_base table
+# =====================================================
+# TRANSFORMAÇÃO
+# =====================================================
 def transform_data():
     con = get_md_connection()
     con.execute("USE cno")
@@ -161,120 +118,179 @@ def transform_data():
             a.* EXCLUDE (CNO),
             v.* EXCLUDE (CNO)
         FROM cno c
-        LEFT JOIN cno_areas a USING (CNO)
-        LEFT JOIN cno_vinculos v USING (CNO)
+        LEFT JOIN (
+            SELECT *
+            FROM (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY CNO ORDER BY rowid DESC) rn
+                FROM cno_areas
+            ) WHERE rn = 1
+        ) a USING (CNO)
+        LEFT JOIN (
+            SELECT *
+            FROM (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY CNO ORDER BY rowid DESC) rn
+                FROM cno_vinculos
+            ) WHERE rn = 1
+        ) v USING (CNO)
     """)
+
+    total = con.execute("SELECT COUNT(*) FROM cno_base").fetchone()[0]
+    print(f"✅ cno_base criada ({total:,})")
 
     con.close()
 
+# =====================================================
+# CNPJ
+# =====================================================
+def padronizar_cnpj(cnpj):
+    return re.sub(r"\D", "", str(cnpj)).zfill(14)
 
-# Search and enrich CNPJs with BrasilAPI
-session = requests.Session()
-session.headers.update({"User-Agent": "cnpj-enrichment/1.0"})
-
+def clean_digits(v):
+    return re.sub(r"\D", "", v) if v else None
 
 def get_cnpj_info(cnpj):
-    for i in range(MAX_TENTATIVAS):
+    for tentativa in range(1, MAX_TENTATIVAS + 1):
         try:
-            r = session.get(f"https://brasilapi.com.br/api/cnpj/v1/{cnpj}", timeout=10)
+            r = requests.get(f"https://brasilapi.com.br/api/cnpj/v1/{cnpj}", timeout=10)
+
             if r.status_code == 200:
                 return r.json()
-            if r.status_code == 404:
-                return {"_status": "cnpj_nao_encontrado"}
-            if r.status_code == 429:
-                time.sleep(10)
-        except Exception:
-            return {"_status": "erro_api"}
-    return {"_status": "erro_api"}
 
-# Create CNPJ table
-def criar_tabela_cnpj(con):
+            if r.status_code == 404:
+                return {"_status": "nao_encontrado"}
+
+            time.sleep(tentativa * 2)
+
+        except requests.exceptions.RequestException:
+            time.sleep(tentativa * 2)
+
+    return {"_status": "erro"}
+
+# =====================================================
+# TABELA DESTINO (CORRIGIDA)
+# =====================================================
+def criar_tabela_destino(con):
     con.execute(f"""
-        CREATE TABLE IF NOT EXISTS {TABLE_CNPJ} (
-            cnpj VARCHAR,
+        CREATE TABLE IF NOT EXISTS {TABLE_DESTINO} (
+            cnpj VARCHAR PRIMARY KEY,
             razao_social VARCHAR,
             nome_fantasia VARCHAR,
+            logradouro VARCHAR,
+            numero VARCHAR,
+            bairro VARCHAR,
             municipio VARCHAR,
             uf VARCHAR,
+            cep VARCHAR,
             situacao_cadastral VARCHAR,
+            tipo_estabelecimento VARCHAR,
             porte VARCHAR,
             natureza_juridica VARCHAR,
+            email VARCHAR,
+            telefone_1 VARCHAR,
+            telefone_2 VARCHAR,
             data_abertura DATE,
             data_consulta TIMESTAMP,
             status_consulta VARCHAR
         )
     """)
-    con.execute(f"""
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_cnpj
-        ON {TABLE_CNPJ}(cnpj)
-    """)
+    print("✅ Tabela destino pronta")
 
+# =====================================================
+# PROCESSAMENTO
+# =====================================================
+def processar_cnpj(cnpj):
+    info = get_cnpj_info(cnpj)
 
-def enrich_cnpjs():
+    if "_status" in info:
+        return {
+            "cnpj": cnpj,
+            "data_consulta": datetime.utcnow(),
+            "status_consulta": info["_status"]
+        }
+
+    return {
+        "cnpj": cnpj,
+        "razao_social": info.get("razao_social"),
+        "nome_fantasia": info.get("nome_fantasia"),
+        "logradouro": info.get("logradouro"),
+        "numero": info.get("numero"),
+        "bairro": info.get("bairro"),
+        "municipio": info.get("municipio"),
+        "uf": info.get("uf"),
+        "cep": clean_digits(info.get("cep")),
+        "situacao_cadastral": info.get("descricao_situacao_cadastral"),
+        "tipo_estabelecimento": info.get("descricao_identificador_matriz_filial"),
+        "porte": info.get("porte"),
+        "natureza_juridica": info.get("natureza_juridica"),
+        "email": info.get("email"),
+        "telefone_1": clean_digits(info.get("ddd_telefone_1")),
+        "telefone_2": clean_digits(info.get("ddd_telefone_2")),
+        "data_abertura": (
+            datetime.strptime(info["data_inicio_atividade"], "%Y-%m-%d").date()
+            if info.get("data_inicio_atividade") else None
+        ),
+        "data_consulta": datetime.utcnow(),
+        "status_consulta": "ok"
+    }
+
+def dados_cnpj():
     con = get_md_connection()
-    con.execute("USE cno")
-    criar_tabela_cnpj(con)
+    criar_tabela_destino(con)
 
-    df = con.execute(f"""
-        SELECT DISTINCT
-            regexp_replace("NI do responsável", '\\D', '', 'g') AS cnpj
-        FROM {TABLE_ORIGEM_CNPJ}
+    df = con.execute("""
+        SELECT DISTINCT regexp_replace("NI do responsável", '\\D', '', 'g') cnpj
+        FROM cno.cno_vinculos
         WHERE "NI do responsável" IS NOT NULL
+          AND regexp_replace("NI do responsável", '\\D', '', 'g')
+              NOT IN (SELECT cnpj FROM cnpj_cadastral)
     """).df()
+
+    cnpjs = df["cnpj"].dropna().tolist()
+    total = len(cnpjs)
+    print(f"🔎 {total} CNPJs novos")
 
     buffer = []
 
-    for i, cnpj in enumerate(df["cnpj"], start=1):
-        info = get_cnpj_info(padronizar_cnpj(cnpj))
-
-        row = {
-            "cnpj": padronizar_cnpj(cnpj),
-            "data_consulta": datetime.utcnow(),
-            "status_consulta": info.get("_status", "ok")
-        }
-
-        if "_status" not in info:
-            row.update({
-                "razao_social": info.get("razao_social"),
-                "nome_fantasia": info.get("nome_fantasia"),
-                "municipio": info.get("municipio"),
-                "uf": info.get("uf"),
-                "situacao_cadastral": info.get("descricao_situacao_cadastral"),
-                "porte": info.get("porte"),
-                "natureza_juridica": info.get("natureza_juridica"),
-                "data_abertura": (
-                    datetime.strptime(info["data_inicio_atividade"], "%Y-%m-%d").date()
-                    if info.get("data_inicio_atividade") else None
-                )
-            })
-
-        buffer.append(row)
+    for i, cnpj in enumerate(cnpjs, 1):
+        buffer.append(processar_cnpj(padronizar_cnpj(cnpj)))
 
         if len(buffer) >= BATCH_SIZE:
-            con.register("df_tmp", pd.DataFrame(buffer))
-            con.execute(f"INSERT OR IGNORE INTO {TABLE_CNPJ} SELECT * FROM df_tmp")
+            df_tmp = pd.DataFrame(buffer)
+            con.register("df_tmp", df_tmp)
+
+            con.execute("""
+                INSERT OR IGNORE INTO cnpj_cadastral (
+                    cnpj, razao_social, nome_fantasia, logradouro, numero,
+                    bairro, municipio, uf, cep, situacao_cadastral,
+                    tipo_estabelecimento, porte, natureza_juridica,
+                    email, telefone_1, telefone_2, data_abertura,
+                    data_consulta, status_consulta
+                )
+                SELECT
+                    cnpj, razao_social, nome_fantasia, logradouro, numero,
+                    bairro, municipio, uf, cep, situacao_cadastral,
+                    tipo_estabelecimento, porte, natureza_juridica,
+                    email, telefone_1, telefone_2, data_abertura,
+                    data_consulta, status_consulta
+                FROM df_tmp
+            """)
             buffer.clear()
 
         if i % LOG_INTERVAL == 0:
-            print(f"⏳ {i} CNPJs processados")
+            print(f"⏳ {i}/{total}")
 
         time.sleep(SLEEP_SECONDS)
 
-    if buffer:
-        con.register("df_tmp", pd.DataFrame(buffer))
-        con.execute(f"INSERT OR IGNORE INTO {TABLE_CNPJ} SELECT * FROM df_tmp")
-
     con.close()
+    print("✅ Enriquecimento finalizado")
 
-
-# Main pipeline dataflow
+# =====================================================
+# MAIN
+# =====================================================
 def main():
-    print("🚀 PIPELINE INICIADO")
-    extract_and_load_cno()
-    transform_data()
-    enrich_cnpjs()
-    print("🎉 PIPELINE FINALIZADO COM SUCESSO")
-
+    #extract_and_load_raw()
+    #transform_data()
+    dados_cnpj()
 
 if __name__ == "__main__":
     main()
