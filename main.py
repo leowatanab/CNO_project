@@ -288,8 +288,8 @@ def dados_cnpj():
 # MAIN
 # =====================================================
 def main():
-    #extract_and_load_raw()
-    #transform_data()
+    extract_and_load_raw()
+    transform_data()
     dados_cnpj()
 
 if __name__ == "__main__":
