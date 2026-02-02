@@ -15,7 +15,7 @@ from tqdm import tqdm
 # =====================================================
 # CONFIGURAÇÕES
 # =====================================================
-CNO_URL = "https://arquivos.receitafederal.gov.br/dados/cno/cno.zip"
+CNO_URL = "https://arquivos.receitafederal.gov.br/index.php/s/PC6732BXG9B98W3/download?path=%2F&files=cno.zip"
 
 TABLE_DESTINO = "cnpj_cadastral"
 
@@ -288,8 +288,8 @@ def dados_cnpj():
 # MAIN
 # =====================================================
 def main():
-    #extract_and_load_raw()
-    #transform_data()
+    extract_and_load_raw()
+    transform_data()
     dados_cnpj()
 
 if __name__ == "__main__":
