@@ -249,6 +249,6 @@ def dados_cnpj():
     print(f"✅ Enriquecimento da tabela '{TABLE_EMPRESA}' com Capital Social finalizado", flush=True)
 
 if __name__ == "__main__":
-    extract_and_load_raw(threads=8)
-    transform_data()
+    #extract_and_load_raw(threads=8)
+    #transform_data()
     dados_cnpj()
