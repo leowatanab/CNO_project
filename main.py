@@ -269,8 +269,5 @@ def dados_cnpj():
 if __name__ == "__main__":
     #extract_and_load_raw(threads=8)
     #transform_data()
-<<<<<<< HEAD
     dados_cnpj()
-=======
-    dados_cnpj()
->>>>>>> 212813d156ed7672de825fb6315de26dd9540cf6
+
