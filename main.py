@@ -200,13 +200,12 @@ def processar_cnpj(cnpj):
         })
     return (empresa, socios)
 
-# =====================================================
-# ENRIQUECIMENTO
-# =====================================================
+
 def dados_cnpj():
     con = get_md_connection()
     criar_tabelas_destino(con)
 
+    # Busca CNPJs que estão na cno_base mas não na nossa tabela final
     df_faltantes = con.execute(f"""
         SELECT DISTINCT regexp_replace("NI do responsável", '\\D', '', 'g') cnpj
         FROM cno.cno_base
@@ -216,7 +215,7 @@ def dados_cnpj():
 
     cnpjs = df_faltantes["cnpj"].dropna().tolist()
     total = len(cnpjs)
-    print(f"🔎 {total} CNPJs novos em cno_base", flush = True)
+    print(f"🔎 {total} CNPJs novos para processar", flush=True)
 
     for i in range(0, total, BATCH_SIZE):
         batch = cnpjs[i : i + BATCH_SIZE]
@@ -227,28 +226,47 @@ def dados_cnpj():
         lista_e = [r[0] for r in resultados if r[0]]
         lista_s = [s for r in resultados for s in r[1]]
 
+        # --- TRATAMENTO PARA TABELA DE EMPRESAS ---
         if lista_e:
             df_e = pd.DataFrame(lista_e)
-            # Lista de colunas atualizada
             cols_e = ["cnpj", "razao_social", "nome_fantasia", "capital_social", "logradouro", "numero", "bairro", "municipio", "uf", "cep", "situacao_cadastral", "tipo_estabelecimento", "porte", "natureza_juridica", "email", "telefone_1", "telefone_2", "data_abertura", "data_consulta", "status_consulta"]
-            for c in cols_e:
-                if c not in df_e.columns: df_e[c] = None
             
+            for c in cols_e:
+                if c not in df_e.columns:
+                    df_e[c] = None
+                
+                # Força tipo String para campos de texto (evita erro 'str' not recognized)
+                if c not in ["capital_social", "data_abertura", "data_consulta"]:
+                    df_e[c] = df_e[c].astype(str).replace(['None', 'nan', '<NA>', 'NaN'], None)
+                
+            # Garante que capital_social seja float
+            df_e["capital_social"] = pd.to_numeric(df_e["capital_social"], errors='coerce').fillna(0.0)
+
             con.register("tmp_e", df_e[cols_e])
             con.execute(f"INSERT OR IGNORE INTO {TABLE_EMPRESA} SELECT * FROM tmp_e")
+            con.unregister("tmp_e")
 
+        # --- TRATAMENTO PARA TABELA DE SÓCIOS ---
         if lista_s:
             df_s = pd.DataFrame(lista_s)
-            con.register("tmp_s", df_s)
+            cols_s = ["cnpj", "nome_socio", "cnpj_cpf_do_socio", "qualificacao_socio", "data_entrada_sociedade", "faixa_etaria"]
+            
+            for c in cols_s:
+                if c not in ["data_entrada_sociedade"]:
+                    df_s[c] = df_s[c].astype(str).replace(['None', 'nan', '<NA>', 'NaN'], None)
+            
+            con.register("tmp_s", df_s[cols_s])
             con.execute(f"INSERT INTO {TABLE_SOCIOS} SELECT * FROM tmp_s")
+            con.unregister("tmp_s")
 
+        # Log de progresso com flush para o GitHub Actions
         print(f"⏳ Processado: {min(i + BATCH_SIZE, total)}/{total}", flush=True)
         time.sleep(SLEEP_SECONDS)
 
     con.close()
-    print(f"✅ Enriquecimento da tabela '{TABLE_EMPRESA}' com Capital Social finalizado", flush=True)
+    print(f"✅ Enriquecimento da tabela '{TABLE_EMPRESA}' finalizado!", flush=True)
 
 if __name__ == "__main__":
-    extract_and_load_raw(threads=8)
-    transform_data()
+    #extract_and_load_raw(threads=8)
+    #transform_data()
     dados_cnpj()
