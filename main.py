@@ -58,7 +58,7 @@ def extract_and_load_raw(threads: int = 8):
     workdir = tempfile.mkdtemp(prefix="cno_")
     zip_path = os.path.join(workdir, "cno.zip")
     try:
-        print("⬇️ Baixando CNO...")
+        print("⬇️ Baixando CNO...", flush=True)
         r = requests.get(CNO_URL, stream=True, timeout=120)
         r.raise_for_status()
         with open(zip_path, "wb") as f:
@@ -92,7 +92,7 @@ def extract_and_load_raw(threads: int = 8):
 
                 con.execute(f"CREATE TABLE IF NOT EXISTS {qi(table)} AS SELECT * FROM read_csv_auto('{csv_path}', ALL_VARCHAR=TRUE)")
         con.close()
-        print("✅ CNO carregado")
+        print("✅ CNO carregado", flush=True)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -108,7 +108,7 @@ def transform_data():
         FROM cno c
         LEFT JOIN (SELECT *, ROW_NUMBER() OVER (PARTITION BY CNO ORDER BY rowid DESC) rn FROM cno_areas) a ON c.CNO = a.CNO AND a.rn = 1
     """)
-    print(f"✅ cno_base criada")
+    print(f"✅ cno_base criada", flush=True)
     con.close()
 
 def get_cnpj_info(cnpj):
@@ -158,7 +158,7 @@ def criar_tabelas_destino(con):
             faixa_etaria VARCHAR
         );
     """)
-    print(f"✅ Tabelas '{TABLE_EMPRESA}' e '{TABLE_SOCIOS}' prontas")
+    print(f"✅ Tabelas '{TABLE_EMPRESA}' e '{TABLE_SOCIOS}' prontas", flush=True)
 
 def processar_cnpj(cnpj):
     info = get_cnpj_info(cnpj)
@@ -216,7 +216,7 @@ def dados_cnpj():
 
     cnpjs = df_faltantes["cnpj"].dropna().tolist()
     total = len(cnpjs)
-    print(f"🔎 {total} CNPJs novos em cno_base")
+    print(f"🔎 {total} CNPJs novos em cno_base", flush = True)
 
     for i in range(0, total, BATCH_SIZE):
         batch = cnpjs[i : i + BATCH_SIZE]
@@ -242,11 +242,11 @@ def dados_cnpj():
             con.register("tmp_s", df_s)
             con.execute(f"INSERT INTO {TABLE_SOCIOS} SELECT * FROM tmp_s")
 
-        print(f"⏳ Processado: {min(i + BATCH_SIZE, total)}/{total}")
+        print(f"⏳ Processado: {min(i + BATCH_SIZE, total)}/{total}", flush=True)
         time.sleep(SLEEP_SECONDS)
 
     con.close()
-    print(f"✅ Enriquecimento da tabela '{TABLE_EMPRESA}' com Capital Social finalizado")
+    print(f"✅ Enriquecimento da tabela '{TABLE_EMPRESA}' com Capital Social finalizado", flush=True)
 
 if __name__ == "__main__":
     extract_and_load_raw(threads=8)
