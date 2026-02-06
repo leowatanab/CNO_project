@@ -205,7 +205,6 @@ def dados_cnpj():
     con = get_md_connection()
     criar_tabelas_destino(con)
 
-    # Busca CNPJs que estão na cno_base mas não na nossa tabela final
     df_faltantes = con.execute(f"""
         SELECT DISTINCT regexp_replace("NI do responsável", '\\D', '', 'g') cnpj
         FROM cno.cno_base
@@ -226,45 +225,51 @@ def dados_cnpj():
         lista_e = [r[0] for r in resultados if r[0]]
         lista_s = [s for r in resultados for s in r[1]]
 
-        # --- TRATAMENTO PARA TABELA DE EMPRESAS ---
+        # --- PROCESSAMENTO EMPRESAS ---
         if lista_e:
             df_e = pd.DataFrame(lista_e)
-            cols_e = ["cnpj", "razao_social", "nome_fantasia", "capital_social", "logradouro", "numero", "bairro", "municipio", "uf", "cep", "situacao_cadastral", "tipo_estabelecimento", "porte", "natureza_juridica", "email", "telefone_1", "telefone_2", "data_abertura", "data_consulta", "status_consulta"]
             
+            # 1. Garantir que todas as colunas existam
+            cols_e = ["cnpj", "razao_social", "nome_fantasia", "capital_social", "logradouro", "numero", "bairro", "municipio", "uf", "cep", "situacao_cadastral", "tipo_estabelecimento", "porte", "natureza_juridica", "email", "telefone_1", "telefone_2", "data_abertura", "data_consulta", "status_consulta"]
             for c in cols_e:
-                if c not in df_e.columns:
-                    df_e[c] = None
-                
-                # Força tipo String para campos de texto (evita erro 'str' not recognized)
-                if c not in ["capital_social", "data_abertura", "data_consulta"]:
-                    df_e[c] = df_e[c].astype(str).replace(['None', 'nan', '<NA>', 'NaN'], None)
-                
-            # Garante que capital_social seja float
-            df_e["capital_social"] = pd.to_numeric(df_e["capital_social"], errors='coerce').fillna(0.0)
+                if c not in df_e.columns: df_e[c] = None
+            
+            df_e = df_e[cols_e].copy()
 
-            con.register("tmp_e", df_e[cols_e])
+            # 2. Forçar tipos para evitar o erro 'str' no GitHub Actions
+            # Convertemos para string do Python e garantimos que o DuckDB veja como VARCHAR
+            for col in df_e.columns:
+                if col in ["data_abertura", "data_consulta"]:
+                    df_e[col] = pd.to_datetime(df_e[col], errors='coerce')
+                elif col == "capital_social":
+                    df_e[col] = pd.to_numeric(df_e[col], errors='coerce').fillna(0.0).astype(float)
+                else:
+                    # O segredo: converter para string e tratar nulos de forma que o DuckDB entenda
+                    df_e[col] = df_e[col].astype(str).replace(['None', 'nan', '<NA>'], None)
+
+            # 3. Registro explícito (ajuda o DuckDB a não tentar adivinhar)
+            con.register("tmp_e", df_e)
             con.execute(f"INSERT OR IGNORE INTO {TABLE_EMPRESA} SELECT * FROM tmp_e")
             con.unregister("tmp_e")
 
-        # --- TRATAMENTO PARA TABELA DE SÓCIOS ---
+        # --- PROCESSAMENTO SÓCIOS ---
         if lista_s:
             df_s = pd.DataFrame(lista_s)
-            cols_s = ["cnpj", "nome_socio", "cnpj_cpf_do_socio", "qualificacao_socio", "data_entrada_sociedade", "faixa_etaria"]
-            
-            for c in cols_s:
-                if c not in ["data_entrada_sociedade"]:
-                    df_s[c] = df_s[c].astype(str).replace(['None', 'nan', '<NA>', 'NaN'], None)
-            
-            con.register("tmp_s", df_s[cols_s])
+            for col in df_s.columns:
+                if col == "data_entrada_sociedade":
+                    df_s[col] = pd.to_datetime(df_s[col], errors='coerce')
+                else:
+                    df_s[col] = df_s[col].astype(str).replace(['None', 'nan', '<NA>'], None)
+
+            con.register("tmp_s", df_s)
             con.execute(f"INSERT INTO {TABLE_SOCIOS} SELECT * FROM tmp_s")
             con.unregister("tmp_s")
 
-        # Log de progresso com flush para o GitHub Actions
-        print(f"⏳ Processado: {min(i + BATCH_SIZE, total)}/{total}", flush=True)
+        print(f"⏳ Progresso: {min(i + BATCH_SIZE, total)}/{total}", flush=True)
         time.sleep(SLEEP_SECONDS)
 
     con.close()
-    print(f"✅ Enriquecimento da tabela '{TABLE_EMPRESA}' finalizado!", flush=True)
+    print(f"✅ Lote finalizado!", flush=True)
 
 if __name__ == "__main__":
     #extract_and_load_raw(threads=8)
