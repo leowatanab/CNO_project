@@ -104,7 +104,7 @@ def transform_data():
     con.execute("USE cno")
     con.execute("""
         CREATE OR REPLACE TABLE base_cno AS
-        SELECT c.*, a.* EXCLUDE (CNO), v.* EXCLUDE (CNO)
+        SELECT c.*, a.* EXCLUDE (CNO)
         FROM cno c
         LEFT JOIN (SELECT *, ROW_NUMBER() OVER (PARTITION BY CNO ORDER BY rowid DESC) rn FROM cno_areas) a ON c.CNO = a.CNO AND a.rn = 1
     """)
@@ -272,7 +272,7 @@ def dados_cnpj():
     print(f"✅ Lote finalizado!", flush=True)
 
 if __name__ == "__main__":
-    #extract_and_load_raw(threads=8)
-    #transform_data()
+    extract_and_load_raw(threads=8)
+    transform_data()
     dados_cnpj()
 
