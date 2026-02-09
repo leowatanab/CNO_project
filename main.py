@@ -9,9 +9,13 @@ import shutil
 import zipfile
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
+from dotenv import load_dotenv
+
+# Load .env file (for MOTHERDUCK_TOKEN)
+load_dotenv()
 
 # =====================================================
-# CONFIGURAÇÕES
+# CONFIGURATIONS
 # =====================================================
 CNO_URL = "https://arquivos.receitafederal.gov.br/index.php/s/PC6732BXG9B98W3/download?path=%2F&files=cno.zip"
 
@@ -19,29 +23,21 @@ TABLE_EMPRESA = "cnpj"
 TABLE_SOCIOS = "cnpj_socios"
 
 SLEEP_SECONDS = 0.5   
-MAX_TENTATIVAS = 3
+MAX_TENTATIVAS_PADRAO = 3
 BATCH_SIZE = 50       
 MAX_WORKERS = 10      
 
-
-
 # =====================================================
-# CONEXÃO MOTHERDUCK
+# CONNECTION & UTILS
 # =====================================================
 def get_md_connection():
     token = os.getenv("MOTHERDUCK_TOKEN")
     if not token:
-        raise ValueError("❌ MOTHERDUCK_TOKEN não encontrado")
+        raise ValueError("❌ MOTHERDUCK_TOKEN não encontrado no ambiente ou arquivo .env")
     con = duckdb.connect(f"md:cno?motherduck_token={token}")
     con.execute("USE main")
     return con
 
-def qi(name: str) -> str:
-    return '"' + name.replace('"', '""') + '"'
-
-# =====================================================
-# APOIO CNPJ
-# =====================================================
 def padronizar_cnpj(cnpj):
     return re.sub(r"\D", "", str(cnpj)).zfill(14)
 
@@ -52,7 +48,27 @@ def qi(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 # =====================================================
-# EXTRAÇÃO + CARGA INCREMENTAL DO CNO
+# API CALLS
+# =====================================================
+def get_cnpj_info(cnpj, max_retries):
+    """Queries BrasilAPI with custom retry logic and exponential backoff."""
+    for tentativa in range(1, max_retries + 1):
+        try:
+            r = requests.get(f"https://brasilapi.com.br/api/cnpj/v1/{cnpj}", timeout=15)
+            if r.status_code == 200: 
+                return r.json()
+            if r.status_code == 404: 
+                return {"_status": "nao_encontrado"}
+            if r.status_code == 429: # Rate limit
+                time.sleep(tentativa * 5)
+            else:
+                time.sleep(tentativa * 2)
+        except Exception:
+            time.sleep(tentativa * 2)
+    return {"_status": "erro"}
+
+# =====================================================
+# DATA EXTRACTION & TRANSFORM (CNO)
 # =====================================================
 def extract_and_load_raw(threads: int = 8):
     workdir = tempfile.mkdtemp(prefix="cno_")
@@ -78,7 +94,6 @@ def extract_and_load_raw(threads: int = 8):
                 
                 csv_path = os.path.join(workdir, file)
                 os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-                
                 with z.open(file) as src:
                     data = src.read()
                 
@@ -96,9 +111,6 @@ def extract_and_load_raw(threads: int = 8):
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
-# =====================================================
-# TRANSFORMAÇÃO
-# =====================================================
 def transform_data():
     con = get_md_connection()
     con.execute("USE cno")
@@ -108,22 +120,11 @@ def transform_data():
         FROM cno c
         LEFT JOIN (SELECT *, ROW_NUMBER() OVER (PARTITION BY CNO ORDER BY rowid DESC) rn FROM cno_areas) a ON c.CNO = a.CNO AND a.rn = 1
     """)
-    print(f"✅ cno_base criada", flush=True)
+    print(f"✅ base_cno criada/atualizada", flush=True)
     con.close()
 
-def get_cnpj_info(cnpj):
-    for tentativa in range(1, MAX_TENTATIVAS + 1):
-        try:
-            r = requests.get(f"https://brasilapi.com.br/api/cnpj/v1/{cnpj}", timeout=15)
-            if r.status_code == 200: return r.json()
-            if r.status_code == 404: return {"_status": "nao_encontrado"}
-            time.sleep(tentativa * 2)
-        except:
-            time.sleep(tentativa * 2)
-    return {"_status": "erro"}
-
 # =====================================================
-# CRIAÇÃO DAS TABELAS (INCLUINDO CAPITAL SOCIAL)
+# CNPJ PROCESSING LOGIC
 # =====================================================
 def criar_tabelas_destino(con):
     con.execute(f"""
@@ -131,7 +132,7 @@ def criar_tabelas_destino(con):
             cnpj VARCHAR PRIMARY KEY, 
             razao_social VARCHAR, 
             nome_fantasia VARCHAR, 
-            capital_social DOUBLE,  -- Adicionado
+            capital_social DOUBLE, 
             logradouro VARCHAR, 
             numero VARCHAR, 
             bairro VARCHAR, 
@@ -158,10 +159,10 @@ def criar_tabelas_destino(con):
             faixa_etaria VARCHAR
         );
     """)
-    print(f"✅ Tabelas '{TABLE_EMPRESA}' e '{TABLE_SOCIOS}' prontas", flush=True)
 
-def processar_cnpj(cnpj):
-    info = get_cnpj_info(cnpj)
+def processar_cnpj(cnpj, max_retries):
+    info = get_cnpj_info(cnpj, max_retries)
+    
     if "_status" in info:
         return ({"cnpj": cnpj, "data_consulta": datetime.utcnow(), "status_consulta": info["_status"]}, [])
 
@@ -169,7 +170,7 @@ def processar_cnpj(cnpj):
         "cnpj": cnpj, 
         "razao_social": info.get("razao_social"), 
         "nome_fantasia": info.get("nome_fantasia"),
-        "capital_social": float(info.get("capital_social", 0)), # Capturando capital social
+        "capital_social": float(info.get("capital_social", 0)),
         "logradouro": info.get("logradouro"), 
         "numero": info.get("numero"), 
         "bairro": info.get("bairro"),
@@ -200,8 +201,41 @@ def processar_cnpj(cnpj):
         })
     return (empresa, socios)
 
+def normalize_and_load(con, table_name, df, mode="IGNORE"):
+    """Trata tipos de dados e realiza a inserção conforme a restrição da tabela."""
+    if df.empty: return
 
+    # Forçar tipos de dados para evitar erros de conversão no DuckDB
+    for col in df.columns:
+        if "data_" in col:
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+        elif col == "capital_social":
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0).astype(float)
+        else:
+            df[col] = df[col].astype(str).replace(['None', 'nan', '<NA>', 'NaN'], None)
+
+    temp_name = f"tmp_{table_name}_{int(time.time() * 1000)}" # Usando milissegundos para evitar conflito
+    con.register(temp_name, df)
+    
+    # Lógica de inserção
+    if table_name == TABLE_EMPRESA:
+        # A tabela de empresas TEM Primary Key, então podemos usar OR IGNORE / OR REPLACE
+        if mode == "IGNORE":
+            con.execute(f"INSERT OR IGNORE INTO cno.main.{table_name} SELECT * FROM {temp_name}")
+        elif mode == "REPLACE":
+            con.execute(f"INSERT OR REPLACE INTO cno.main.{table_name} SELECT * FROM {temp_name}")
+    else:
+        # A tabela de sócios NÃO TEM Primary Key. 
+        # Como já rodamos o DELETE antes no reprocessamento, um INSERT simples resolve.
+        con.execute(f"INSERT INTO cno.main.{table_name} SELECT * FROM {temp_name}")
+    
+    con.unregister(temp_name)
+
+# =====================================================
+# MAIN WORKFLOWS
+# =====================================================
 def dados_cnpj():
+    """Fetches and inserts new CNPJs that aren't in the database yet."""
     con = get_md_connection()
     criar_tabelas_destino(con)
 
@@ -209,7 +243,7 @@ def dados_cnpj():
         SELECT DISTINCT regexp_replace("NI do responsável", '\\D', '', 'g') cnpj
         FROM cno.cno_base
         WHERE "NI do responsável" IS NOT NULL
-          AND cnpj NOT IN (SELECT cnpj FROM {TABLE_EMPRESA})
+          AND cnpj NOT IN (SELECT cnpj FROM cno.main.{TABLE_EMPRESA})
     """).df()
 
     cnpjs = df_faltantes["cnpj"].dropna().tolist()
@@ -218,61 +252,73 @@ def dados_cnpj():
 
     for i in range(0, total, BATCH_SIZE):
         batch = cnpjs[i : i + BATCH_SIZE]
-        
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            resultados = list(executor.map(lambda c: processar_cnpj(padronizar_cnpj(c)), batch))
+            resultados = list(executor.map(lambda c: processar_cnpj(padronizar_cnpj(c), MAX_TENTATIVAS_PADRAO), batch))
 
         lista_e = [r[0] for r in resultados if r[0]]
         lista_s = [s for r in resultados for s in r[1]]
 
-        # --- PROCESSAMENTO EMPRESAS ---
-        if lista_e:
-            df_e = pd.DataFrame(lista_e)
-            
-            # 1. Garantir que todas as colunas existam
-            cols_e = ["cnpj", "razao_social", "nome_fantasia", "capital_social", "logradouro", "numero", "bairro", "municipio", "uf", "cep", "situacao_cadastral", "tipo_estabelecimento", "porte", "natureza_juridica", "email", "telefone_1", "telefone_2", "data_abertura", "data_consulta", "status_consulta"]
-            for c in cols_e:
-                if c not in df_e.columns: df_e[c] = None
-            
-            df_e = df_e[cols_e].copy()
-
-            # 2. Forçar tipos para evitar o erro 'str' no GitHub Actions
-            # Convertemos para string do Python e garantimos que o DuckDB veja como VARCHAR
-            for col in df_e.columns:
-                if col in ["data_abertura", "data_consulta"]:
-                    df_e[col] = pd.to_datetime(df_e[col], errors='coerce')
-                elif col == "capital_social":
-                    df_e[col] = pd.to_numeric(df_e[col], errors='coerce').fillna(0.0).astype(float)
-                else:
-                    # O segredo: converter para string e tratar nulos de forma que o DuckDB entenda
-                    df_e[col] = df_e[col].astype(str).replace(['None', 'nan', '<NA>'], None)
-
-            # 3. Registro explícito (ajuda o DuckDB a não tentar adivinhar)
-            con.register("tmp_e", df_e)
-            con.execute(f"INSERT OR IGNORE INTO {TABLE_EMPRESA} SELECT * FROM tmp_e")
-            con.unregister("tmp_e")
-
-        # --- PROCESSAMENTO SÓCIOS ---
-        if lista_s:
-            df_s = pd.DataFrame(lista_s)
-            for col in df_s.columns:
-                if col == "data_entrada_sociedade":
-                    df_s[col] = pd.to_datetime(df_s[col], errors='coerce')
-                else:
-                    df_s[col] = df_s[col].astype(str).replace(['None', 'nan', '<NA>'], None)
-
-            con.register("tmp_s", df_s)
-            con.execute(f"INSERT INTO {TABLE_SOCIOS} SELECT * FROM tmp_s")
-            con.unregister("tmp_s")
+        if lista_e: normalize_and_load(con, TABLE_EMPRESA, pd.DataFrame(lista_e), "IGNORE")
+        if lista_s: normalize_and_load(con, TABLE_SOCIOS, pd.DataFrame(lista_s), "IGNORE")
 
         print(f"⏳ Progresso: {min(i + BATCH_SIZE, total)}/{total}", flush=True)
         time.sleep(SLEEP_SECONDS)
-
     con.close()
-    print(f"✅ Lote finalizado!", flush=True)
 
+def reprocessar_erros():
+    """Identifica falhas anteriores e tenta novamente com prioridade (10 tentativas)."""
+    con = get_md_connection()
+    df_erros = con.execute(f"SELECT cnpj FROM cno.main.{TABLE_EMPRESA} WHERE status_consulta = 'erro'").df()
+    cnpjs_falhos = df_erros["cnpj"].tolist()
+    total = len(cnpjs_falhos)
+    
+    if total == 0:
+        print("✅ Nenhum CNPJ com status 'erro' para reprocessar.")
+        con.close()
+        return
+
+    print(f"🔄 Reprocessando {total} erros com limite de 10 tentativas...", flush=True)
+
+    for i in range(0, total, BATCH_SIZE):
+        batch = cnpjs_falhos[i : i + BATCH_SIZE]
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            resultados = list(executor.map(lambda c: processar_cnpj(c, 10), batch))
+
+        lista_e = [r[0] for r in resultados if r[0]]
+        lista_s = [s for r in resultados for s in r[1]]
+
+        if lista_e:
+            normalize_and_load(con, TABLE_EMPRESA, pd.DataFrame(lista_e), "REPLACE")
+
+        if lista_s:
+            df_s = pd.DataFrame(lista_s)
+            # --- CORREÇÃO AQUI ---
+            # Pegamos os CNPJs únicos do lote e formatamos como uma string para o SQL: 'cnpj1', 'cnpj2'
+            cnpjs_unicos = df_s['cnpj'].unique().tolist()
+            cnpjs_sql = ", ".join([f"'{c}'" for c in cnpjs_unicos])
+            
+            # Deletamos os sócios antigos antes de inserir os novos para evitar duplicidade
+            con.execute(f"DELETE FROM cno.main.{TABLE_SOCIOS} WHERE cnpj IN ({cnpjs_sql})")
+            # ---------------------
+            
+            normalize_and_load(con, TABLE_SOCIOS, df_s, "IGNORE")
+
+        print(f"⏳ Reprocessamento: {min(i + BATCH_SIZE, total)}/{total}", flush=True)
+        time.sleep(SLEEP_SECONDS)
+    
+    con.close()
+    print("✅ Reprocessamento finalizado!")
+
+# =====================================================
+# EXECUTION
+# =====================================================
 if __name__ == "__main__":
+    # 1. Update Raw Data
     extract_and_load_raw(threads=8)
     transform_data()
+    
+    # 2. Process new entries
     dados_cnpj()
-
+    
+    # 3. Retry previous failures (Rewrite data)
+    reprocessar_erros()
