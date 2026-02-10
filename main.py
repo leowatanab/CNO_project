@@ -9,10 +9,6 @@ import shutil
 import zipfile
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
-from dotenv import load_dotenv
-
-# Load .env file (for MOTHERDUCK_TOKEN)
-load_dotenv()
 
 # =====================================================
 # CONFIGURATIONS
