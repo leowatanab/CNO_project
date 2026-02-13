@@ -101,7 +101,7 @@ def extract_and_load_raw(threads: int = 8):
                 with open(csv_path, "w", encoding="utf-8") as f:
                     f.write(decoded)
 
-                con.execute(f"CREATE TABLE IF NOT EXISTS {qi(table)} AS SELECT * FROM read_csv_auto('{csv_path}', ALL_VARCHAR=TRUE)")
+                con.execute(f"CREATE OR REPLACE TABLE {qi(table)} AS SELECT * FROM read_csv_auto('{csv_path}', ALL_VARCHAR=TRUE)")
         con.close()
         print("✅ CNO carregado", flush=True)
     finally:
@@ -110,13 +110,21 @@ def extract_and_load_raw(threads: int = 8):
 def transform_data():
     con = get_md_connection()
     con.execute("USE cno")
+    
+    # Criamos a base filtrando pela data de registro
+    # Nota: Ajuste o nome da coluna "Data de registro" se no CSV original for diferente
     con.execute("""
         CREATE OR REPLACE TABLE base_cno AS
         SELECT c.*, a.* EXCLUDE (CNO)
         FROM cno c
-        LEFT JOIN (SELECT *, ROW_NUMBER() OVER (PARTITION BY CNO ORDER BY rowid DESC) rn FROM cno_areas) a ON c.CNO = a.CNO AND a.rn = 1
+        LEFT JOIN (
+            SELECT *, ROW_NUMBER() OVER (PARTITION BY CNO ORDER BY rowid DESC) rn 
+            FROM cno_areas
+        ) a ON c.CNO = a.CNO AND a.rn = 1
+        WHERE CAST(c."Data de registro" AS DATE) >= '2020-01-01'
     """)
-    print(f"✅ base_cno criada/atualizada", flush=True)
+    
+    print(f"✅ base_cno criada/atualizada (Apenas registros >= 2020)", flush=True)
     con.close()
 
 # =====================================================
@@ -237,7 +245,7 @@ def dados_cnpj():
 
     df_faltantes = con.execute(f"""
         SELECT DISTINCT regexp_replace("NI do responsável", '\\D', '', 'g') cnpj
-        FROM cno.cno_base
+        FROM cno.base_cno
         WHERE "NI do responsável" IS NOT NULL
           AND cnpj NOT IN (SELECT cnpj FROM cno.main.{TABLE_EMPRESA})
     """).df()
