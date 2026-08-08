@@ -65,6 +65,8 @@ MAX_WORKERS = int(os.getenv("CNO_MAX_WORKERS", "10"))
 # Zero desabilita o limite. É útil em ambientes com disco restrito.
 MAX_DOWNLOAD_BYTES = int(os.getenv("CNO_MAX_DOWNLOAD_BYTES", "0"))
 MAX_UNCOMPRESSED_BYTES = int(os.getenv("CNO_MAX_UNCOMPRESSED_BYTES", "0"))
+DUCKDB_CSV_ENCODINGS = ("utf-8", "latin-1", "utf-16")
+PYTHON_TRANSCODE_ENCODINGS = ("cp1252", "latin-1")
 
 EMPRESA_COLUMNS = [
     "cnpj",
@@ -352,25 +354,82 @@ def detect_csv_encoding(path: Path, sample_size: int = 1024 * 1024) -> str:
         return "latin-1"
 
 
+def csv_encoding_candidates(preferred: str) -> list[str]:
+    candidates = [preferred, *DUCKDB_CSV_ENCODINGS]
+    return list(dict.fromkeys(candidates))
+
+
+def is_csv_encoding_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "encoded" in message or "invalid unicode" in message
+
+
+def transcode_csv_to_utf8(
+    source_path: Path,
+    destination_path: Path,
+    source_encoding: str,
+) -> None:
+    """Recodifica em streaming para UTF-8 quando o leitor nativo falha."""
+    with (
+        source_path.open(
+            "r",
+            encoding=source_encoding,
+            errors="replace",
+            newline="",
+        ) as source,
+        destination_path.open("w", encoding="utf-8", newline="") as destination,
+    ):
+        shutil.copyfileobj(source, destination, length=COPY_CHUNK_SIZE)
+
+
 def _load_csv_to_staging(con, path: Path, staging_table: str, encoding: str) -> None:
-    def load(selected_encoding: str) -> None:
+    def load(load_path: Path, selected_encoding: str) -> None:
         con.execute(
             f"CREATE TABLE {qi(staging_table)} AS "
-            f"SELECT * FROM read_csv_auto({sql_string(path)}, "
+            f"SELECT * FROM read_csv_auto({sql_string(load_path)}, "
             f"all_varchar=true, encoding={sql_string(selected_encoding)})"
         )
 
+    failures: list[str] = []
+    for selected_encoding in csv_encoding_candidates(encoding):
+        try:
+            load(path, selected_encoding)
+            return
+        except Exception as exc:
+            con.execute(f"DROP TABLE IF EXISTS {qi(staging_table)}")
+            failures.append(f"{selected_encoding}: {exc}")
+            if not is_csv_encoding_error(exc):
+                raise
+            LOG.warning(
+                "%s nao carregou como %s; tentando proximo encoding",
+                path.name,
+                selected_encoding,
+            )
+
+    recoded_path = path.with_suffix(path.suffix + ".utf8")
     try:
-        load(encoding)
-    except Exception:
-        # A amostra pode ser UTF-8 válida mesmo quando um byte inválido só
-        # aparece no fim do arquivo. O segundo passe evita uma recodificação
-        # integral em Python e deixa o leitor vetorizado do DuckDB trabalhar.
-        con.execute(f"DROP TABLE IF EXISTS {qi(staging_table)}")
-        if encoding != "utf-8":
-            raise
-        LOG.warning("%s não é UTF-8 completo; tentando Latin-1", path.name)
-        load("latin-1")
+        for source_encoding in PYTHON_TRANSCODE_ENCODINGS:
+            try:
+                LOG.warning(
+                    "Recodificando %s de %s para UTF-8 em streaming",
+                    path.name,
+                    source_encoding,
+                )
+                transcode_csv_to_utf8(path, recoded_path, source_encoding)
+                load(recoded_path, "utf-8")
+                return
+            except Exception as exc:
+                con.execute(f"DROP TABLE IF EXISTS {qi(staging_table)}")
+                failures.append(f"{source_encoding}->utf-8: {exc}")
+                if not is_csv_encoding_error(exc):
+                    raise
+    finally:
+        recoded_path.unlink(missing_ok=True)
+
+    details = "\n".join(failures[-5:])
+    raise RuntimeError(
+        f"Nao foi possivel carregar {path.name} com os encodings testados:\n{details}"
+    )
 
 
 def extract_and_load_raw(

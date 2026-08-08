@@ -66,6 +66,7 @@ fallback só é aceito se as tabelas `cno` e `cno_areas` já existirem.
 
 - o download usa streaming, timeout, retry e validação de tamanho/ZIP;
 - os CSVs são descompactados em blocos, sem ocupar seu tamanho inteiro na RAM;
+- CSVs com encoding fora do suporte nativo do DuckDB sao recodificados para UTF-8 em streaming;
 - todos os CSVs são carregados em tabelas de staging antes da troca transacional;
 - nomes e valores usados no SQL são escapados;
 - conexões, arquivos temporários e registros do Pandas são liberados mesmo em erro;
