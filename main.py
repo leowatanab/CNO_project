@@ -29,7 +29,6 @@ import duckdb
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 
 LOG = logging.getLogger("cno_etl")
@@ -41,6 +40,10 @@ CNO_URL = os.getenv(
     "https://arquivos.receitafederal.gov.br/index.php/s/PC6732BXG9B98W3/"
     "download?path=%2F&files=cno.zip",
 )
+CNO_DIRECT_URL = (
+    "https://arquivos.receitafederal.gov.br/public.php/dav/files/"
+    "PC6732BXG9B98W3/?accept=zip&files=cno.zip"
+)
 BRASIL_API_URL = "https://brasilapi.com.br/api/cnpj/v1/{cnpj}"
 
 TABLE_EMPRESA = "cnpj"
@@ -48,7 +51,10 @@ TABLE_SOCIOS = "cnpj_socios"
 
 DOWNLOAD_CHUNK_SIZE = 8 * 1024 * 1024
 COPY_CHUNK_SIZE = 8 * 1024 * 1024
-DOWNLOAD_TIMEOUT = (10, 180)
+DOWNLOAD_TIMEOUT = (
+    float(os.getenv("CNO_CONNECT_TIMEOUT", "30")),
+    float(os.getenv("CNO_READ_TIMEOUT", "300")),
+)
 API_TIMEOUT = (5, 20)
 DOWNLOAD_ATTEMPTS = int(os.getenv("CNO_DOWNLOAD_RETRIES", "3"))
 
@@ -154,19 +160,11 @@ def utc_now_naive() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def _retrying_download_session() -> requests.Session:
-    retry = Retry(
-        total=5,
-        connect=5,
-        read=5,
-        status=5,
-        backoff_factor=1,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset({"GET"}),
-        respect_retry_after_header=True,
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=2, pool_maxsize=2)
+def _download_session() -> requests.Session:
+    # O retry cobre a transferência inteira em ``download_zip``. Manter outro
+    # retry no adapter multiplicaria as tentativas e prenderia o CI antes que o
+    # fallback pudesse ser considerado.
+    adapter = HTTPAdapter(max_retries=0, pool_connections=2, pool_maxsize=2)
     session = requests.Session()
     session.headers["User-Agent"] = "CNO-ETL/2.0"
     session.mount("https://", adapter)
@@ -192,7 +190,7 @@ def _download_zip_once(url: str, destination: Path) -> int:
     last_report = time.monotonic()
 
     try:
-        with _retrying_download_session() as session:
+        with _download_session() as session:
             with session.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT) as response:
                 response.raise_for_status()
                 expected = int(response.headers.get("Content-Length", "0") or 0)
@@ -238,14 +236,30 @@ def _download_zip_once(url: str, destination: Path) -> int:
         raise
 
 
+def _download_urls(primary_url: str) -> list[str]:
+    configured = os.getenv("CNO_FALLBACK_URLS", "")
+    fallbacks = [url.strip() for url in configured.split("|") if url.strip()]
+    if primary_url != CNO_DIRECT_URL:
+        fallbacks.append(CNO_DIRECT_URL)
+    return list(dict.fromkeys([primary_url, *fallbacks]))
+
+
 def download_zip(url: str, destination: Path) -> int:
     """Baixa em streaming e repete transferências interrompidas do início."""
     if DOWNLOAD_ATTEMPTS < 1:
         raise ValueError("CNO_DOWNLOAD_RETRIES deve ser maior que zero")
 
+    urls = _download_urls(url)
     for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        selected_url = urls[(attempt - 1) % len(urls)]
         try:
-            return _download_zip_once(url, destination)
+            LOG.info(
+                "Tentativa de download %d/%d usando %s",
+                attempt,
+                DOWNLOAD_ATTEMPTS,
+                selected_url,
+            )
+            return _download_zip_once(selected_url, destination)
         except (requests.RequestException, OSError, zipfile.BadZipFile) as exc:
             if attempt == DOWNLOAD_ATTEMPTS:
                 raise
@@ -260,6 +274,18 @@ def download_zip(url: str, destination: Path) -> int:
             time.sleep(delay)
 
     raise AssertionError("fluxo de retry do download terminou inesperadamente")
+
+
+def raw_tables_available() -> bool:
+    """Confirma que há uma carga anterior utilizável antes de aceitar fallback."""
+    try:
+        with closing(get_md_connection()) as connection:
+            connection.execute("SELECT 1 FROM cno LIMIT 1")
+            connection.execute("SELECT 1 FROM cno_areas LIMIT 1")
+        return True
+    except Exception as exc:
+        LOG.error("Carga bruta anterior não está disponível: %s", exc)
+        return False
 
 
 def table_name_from_member(member_name: str) -> str:
@@ -347,7 +373,11 @@ def _load_csv_to_staging(con, path: Path, staging_table: str, encoding: str) -> 
         load("latin-1")
 
 
-def extract_and_load_raw(threads: int = 8, url: str = CNO_URL) -> None:
+def extract_and_load_raw(
+    threads: int = 8,
+    url: str = CNO_URL,
+    allow_stale_raw: bool = False,
+) -> bool:
     """Baixa o ZIP, extrai CSVs em streaming e troca as tabelas atomicamente."""
     if threads < 1:
         raise ValueError("threads deve ser maior que zero")
@@ -359,7 +389,18 @@ def extract_and_load_raw(threads: int = 8, url: str = CNO_URL) -> None:
         zip_path = workdir / "cno.zip"
 
         LOG.info("Baixando dados do CNO")
-        downloaded = download_zip(url, zip_path)
+        try:
+            downloaded = download_zip(url, zip_path)
+        except (requests.RequestException, OSError, zipfile.BadZipFile) as exc:
+            if not allow_stale_raw or not raw_tables_available():
+                raise
+            LOG.warning(
+                "Fonte do CNO indisponível após %d tentativa(s): %s. "
+                "Mantendo a carga bruta anterior e continuando o pipeline.",
+                DOWNLOAD_ATTEMPTS,
+                exc,
+            )
+            return False
         LOG.info("ZIP recebido: %.1f MiB", downloaded / 2**20)
 
         try:
@@ -400,6 +441,7 @@ def extract_and_load_raw(threads: int = 8, url: str = CNO_URL) -> None:
 
             staging_tables.clear()
             LOG.info("Carga bruta do CNO concluída (%d tabela(s))", len(members))
+            return True
         finally:
             if connection is not None:
                 for staging, _ in staging_tables:
@@ -724,6 +766,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--threads", type=int, default=8, help="threads do DuckDB")
     parser.add_argument("--url", default=CNO_URL, help="URL do ZIP do CNO")
     parser.add_argument(
+        "--allow-stale-raw",
+        action="store_true",
+        help=(
+            "continua com as tabelas brutas anteriores quando a fonte está "
+            "temporariamente indisponível"
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
         default=os.getenv("CNO_LOG_LEVEL", "INFO").upper(),
@@ -739,7 +789,11 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     if args.stage in ("all", "extract"):
-        extract_and_load_raw(threads=args.threads, url=args.url)
+        extract_and_load_raw(
+            threads=args.threads,
+            url=args.url,
+            allow_stale_raw=args.allow_stale_raw,
+        )
     if args.stage in ("all", "transform"):
         transform_data()
     if args.stage in ("all", "cnpj"):

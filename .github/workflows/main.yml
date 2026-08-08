@@ -8,15 +8,18 @@ on:
 jobs:
   run-python:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
 
       - name: Install requirements
         run: pip install -r requirements.txt
@@ -24,4 +27,7 @@ jobs:
       - name: Run script
         env:
           MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
-        run: python main.py
+          CNO_CONNECT_TIMEOUT: '30'
+          CNO_READ_TIMEOUT: '300'
+          CNO_DOWNLOAD_RETRIES: '3'
+        run: python main.py --allow-stale-raw

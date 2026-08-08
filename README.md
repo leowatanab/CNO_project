@@ -42,6 +42,10 @@ python main.py retry
 Consulte todas as opções com `python main.py --help`. A URL pode ser alterada
 por `--url` ou pela variável `CNO_URL`, sem editar o código.
 
+Em automações recorrentes, `--allow-stale-raw` permite continuar com a última
+carga bruta válida quando a Receita estiver temporariamente indisponível. O
+fallback só é aceito se as tabelas `cno` e `cno_areas` já existirem.
+
 ## Configuração
 
 | Variável | Padrão | Finalidade |
@@ -50,6 +54,9 @@ por `--url` ou pela variável `CNO_URL`, sem editar o código.
 | `CNO_MAX_WORKERS` | `10` | consultas simultâneas à BrasilAPI |
 | `CNO_API_RETRIES` | `3` | tentativas por consulta nova |
 | `CNO_DOWNLOAD_RETRIES` | `3` | tentativas de download completo |
+| `CNO_CONNECT_TIMEOUT` | `30` | timeout de conexão em segundos |
+| `CNO_READ_TIMEOUT` | `300` | timeout entre leituras em segundos |
+| `CNO_FALLBACK_URLS` | vazio | URLs alternativas separadas por `|` |
 | `CNO_BATCH_PAUSE` | `0.5` | pausa em segundos entre lotes |
 | `CNO_LOG_LEVEL` | `INFO` | nível dos logs |
 | `CNO_MAX_DOWNLOAD_BYTES` | `0` | limite opcional do ZIP; zero desabilita |
