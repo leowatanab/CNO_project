@@ -1,328 +1,752 @@
+"""ETL dos dados do Cadastro Nacional de Obras (CNO).
+
+O módulo pode ser importado sem executar o pipeline. Para executar etapas
+específicas, use ``python main.py --help``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
 import os
+import random
 import re
+import shutil
+import tempfile
+import threading
 import time
-import requests
+import unicodedata
+import uuid
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
+from datetime import date, datetime, timezone
+from functools import partial
+from pathlib import Path
+from typing import Any, Iterable
+
 import duckdb
 import pandas as pd
-import tempfile
-import shutil
-import zipfile
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# =====================================================
-# CONFIGURATIONS
-# =====================================================
-CNO_URL = "https://arquivos.receitafederal.gov.br/index.php/s/PC6732BXG9B98W3/download?path=%2F&files=cno.zip"
+
+LOG = logging.getLogger("cno_etl")
+
+# Pode ser sobrescrita sem alterar o código, por exemplo:
+# CNO_URL=https://servidor/arquivo.zip python main.py extract
+CNO_URL = os.getenv(
+    "CNO_URL",
+    "https://arquivos.receitafederal.gov.br/index.php/s/PC6732BXG9B98W3/"
+    "download?path=%2F&files=cno.zip",
+)
+BRASIL_API_URL = "https://brasilapi.com.br/api/cnpj/v1/{cnpj}"
 
 TABLE_EMPRESA = "cnpj"
 TABLE_SOCIOS = "cnpj_socios"
 
-SLEEP_SECONDS = 0.5   
-MAX_TENTATIVAS_PADRAO = 3
-BATCH_SIZE = 50       
-MAX_WORKERS = 10      
+DOWNLOAD_CHUNK_SIZE = 8 * 1024 * 1024
+COPY_CHUNK_SIZE = 8 * 1024 * 1024
+DOWNLOAD_TIMEOUT = (10, 180)
+API_TIMEOUT = (5, 20)
+DOWNLOAD_ATTEMPTS = int(os.getenv("CNO_DOWNLOAD_RETRIES", "3"))
 
-# =====================================================
-# CONNECTION & UTILS
-# =====================================================
+SLEEP_SECONDS = float(os.getenv("CNO_BATCH_PAUSE", "0.5"))
+MAX_TENTATIVAS_PADRAO = int(os.getenv("CNO_API_RETRIES", "3"))
+BATCH_SIZE = int(os.getenv("CNO_BATCH_SIZE", "50"))
+MAX_WORKERS = int(os.getenv("CNO_MAX_WORKERS", "10"))
+# Zero desabilita o limite. É útil em ambientes com disco restrito.
+MAX_DOWNLOAD_BYTES = int(os.getenv("CNO_MAX_DOWNLOAD_BYTES", "0"))
+MAX_UNCOMPRESSED_BYTES = int(os.getenv("CNO_MAX_UNCOMPRESSED_BYTES", "0"))
+
+EMPRESA_COLUMNS = [
+    "cnpj",
+    "razao_social",
+    "nome_fantasia",
+    "capital_social",
+    "logradouro",
+    "numero",
+    "bairro",
+    "municipio",
+    "uf",
+    "cep",
+    "situacao_cadastral",
+    "tipo_estabelecimento",
+    "porte",
+    "natureza_juridica",
+    "email",
+    "telefone_1",
+    "telefone_2",
+    "data_abertura",
+    "data_consulta",
+    "status_consulta",
+]
+
+SOCIOS_COLUMNS = [
+    "cnpj",
+    "nome_socio",
+    "cnpj_cpf_do_socio",
+    "qualificacao_socio",
+    "data_entrada_sociedade",
+    "faixa_etaria",
+]
+
+_thread_local = threading.local()
+
+
 def get_md_connection():
+    """Abre uma conexão com o banco ``cno`` no MotherDuck."""
     token = os.getenv("MOTHERDUCK_TOKEN")
     if not token:
-        raise ValueError("❌ MOTHERDUCK_TOKEN não encontrado no ambiente ou arquivo .env")
-    con = duckdb.connect(f"md:cno?motherduck_token={token}")
-    con.execute("USE main")
-    return con
+        raise RuntimeError("MOTHERDUCK_TOKEN não encontrado no ambiente")
+    connection = duckdb.connect(f"md:cno?motherduck_token={token}")
+    connection.execute("USE main")
+    return connection
 
-def padronizar_cnpj(cnpj):
-    return re.sub(r"\D", "", str(cnpj)).zfill(14)
-
-def clean_digits(v):
-    return re.sub(r"\D", "", str(v)) if v and str(v).strip() else None
 
 def qi(name: str) -> str:
+    """Escapa um identificador SQL."""
     return '"' + name.replace('"', '""') + '"'
 
-# =====================================================
-# API CALLS
-# =====================================================
-def get_cnpj_info(cnpj, max_retries):
-    """Queries BrasilAPI with custom retry logic and exponential backoff."""
-    for tentativa in range(1, max_retries + 1):
+
+def sql_string(value: str | os.PathLike[str]) -> str:
+    """Escapa um valor textual para uso em SQL gerado internamente."""
+    return "'" + os.fspath(value).replace("'", "''") + "'"
+
+
+def qualified_table(table_name: str) -> str:
+    return f"cno.main.{qi(table_name)}"
+
+
+def padronizar_cnpj(cnpj: Any) -> str:
+    digits = re.sub(r"\D", "", str(cnpj))
+    return digits.zfill(14)
+
+
+def clean_digits(value: Any) -> str | None:
+    if value is None or not str(value).strip():
+        return None
+    digits = re.sub(r"\D", "", str(value))
+    return digits or None
+
+
+def parse_date(value: Any) -> date | None:
+    if value is None or not str(value).strip():
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        LOG.warning("Data inválida recebida da API: %r", value)
+        return None
+
+
+def parse_float(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        LOG.warning("Valor numérico inválido recebido da API: %r", value)
+        return 0.0
+
+
+def utc_now_naive() -> datetime:
+    """Timestamp UTC sem timezone, compatível com a coluna TIMESTAMP."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _retrying_download_session() -> requests.Session:
+    retry = Retry(
+        total=5,
+        connect=5,
+        read=5,
+        status=5,
+        backoff_factor=1,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET"}),
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=2, pool_maxsize=2)
+    session = requests.Session()
+    session.headers["User-Agent"] = "CNO-ETL/2.0"
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def _api_session() -> requests.Session:
+    """Mantém um pool HTTP independente por worker."""
+    session = getattr(_thread_local, "api_session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers["User-Agent"] = "CNO-ETL/2.0"
+        adapter = HTTPAdapter(pool_connections=1, pool_maxsize=1, max_retries=0)
+        session.mount("https://", adapter)
+        _thread_local.api_session = session
+    return session
+
+
+def _download_zip_once(url: str, destination: Path) -> int:
+    partial_path = destination.with_suffix(destination.suffix + ".part")
+    downloaded = 0
+    last_report = time.monotonic()
+
+    try:
+        with _retrying_download_session() as session:
+            with session.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT) as response:
+                response.raise_for_status()
+                expected = int(response.headers.get("Content-Length", "0") or 0)
+                if MAX_DOWNLOAD_BYTES and expected > MAX_DOWNLOAD_BYTES:
+                    raise ValueError(
+                        f"Download anunciado ({expected} bytes) excede "
+                        f"CNO_MAX_DOWNLOAD_BYTES ({MAX_DOWNLOAD_BYTES} bytes)"
+                    )
+
+                with partial_path.open("wb") as output:
+                    for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                        if not chunk:
+                            continue
+                        downloaded += len(chunk)
+                        if MAX_DOWNLOAD_BYTES and downloaded > MAX_DOWNLOAD_BYTES:
+                            raise ValueError(
+                                "Download excedeu CNO_MAX_DOWNLOAD_BYTES durante a transferência"
+                            )
+                        output.write(chunk)
+                        if time.monotonic() - last_report >= 10:
+                            if expected:
+                                LOG.info(
+                                    "Download: %.1f/%.1f MiB (%.1f%%)",
+                                    downloaded / 2**20,
+                                    expected / 2**20,
+                                    downloaded * 100 / expected,
+                                )
+                            else:
+                                LOG.info("Download: %.1f MiB", downloaded / 2**20)
+                            last_report = time.monotonic()
+
+                if expected and downloaded != expected:
+                    raise IOError(
+                        f"Download incompleto: recebido={downloaded}, esperado={expected}"
+                    )
+
+        if not zipfile.is_zipfile(partial_path):
+            raise zipfile.BadZipFile("A resposta recebida não é um arquivo ZIP válido")
+        os.replace(partial_path, destination)
+        return downloaded
+    except Exception:
+        partial_path.unlink(missing_ok=True)
+        raise
+
+
+def download_zip(url: str, destination: Path) -> int:
+    """Baixa em streaming e repete transferências interrompidas do início."""
+    if DOWNLOAD_ATTEMPTS < 1:
+        raise ValueError("CNO_DOWNLOAD_RETRIES deve ser maior que zero")
+
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
         try:
-            r = requests.get(f"https://brasilapi.com.br/api/cnpj/v1/{cnpj}", timeout=15)
-            if r.status_code == 200: 
-                return r.json()
-            if r.status_code == 404: 
+            return _download_zip_once(url, destination)
+        except (requests.RequestException, OSError, zipfile.BadZipFile) as exc:
+            if attempt == DOWNLOAD_ATTEMPTS:
+                raise
+            delay = min(2 ** (attempt - 1), 10)
+            LOG.warning(
+                "Download falhou (%d/%d): %s; nova tentativa em %ds",
+                attempt,
+                DOWNLOAD_ATTEMPTS,
+                exc,
+                delay,
+            )
+            time.sleep(delay)
+
+    raise AssertionError("fluxo de retry do download terminou inesperadamente")
+
+
+def table_name_from_member(member_name: str) -> str:
+    """Converte o nome de uma entrada do ZIP em identificador previsível."""
+    stem = Path(member_name.replace("\\", "/")).stem
+    stem = unicodedata.normalize("NFKD", stem).encode("ascii", "ignore").decode()
+    table = re.sub(r"[^a-zA-Z0-9_]+", "_", stem).strip("_").lower()
+    if not table:
+        raise ValueError(f"Nome de CSV inválido no ZIP: {member_name!r}")
+    if table[0].isdigit():
+        table = "cno_" + table
+    return table
+
+
+def csv_members(archive: zipfile.ZipFile) -> list[tuple[zipfile.ZipInfo, str]]:
+    members: list[tuple[zipfile.ZipInfo, str]] = []
+    seen_tables: set[str] = set()
+    total_size = 0
+
+    for info in archive.infolist():
+        if info.is_dir() or not info.filename.lower().endswith(".csv"):
+            continue
+        if info.flag_bits & 0x1:
+            raise ValueError(f"CSV criptografado não é suportado: {info.filename}")
+        table = table_name_from_member(info.filename)
+        if table in seen_tables:
+            raise ValueError(f"Mais de um CSV produziria a tabela {table!r}")
+        seen_tables.add(table)
+        total_size += info.file_size
+        members.append((info, table))
+
+    if not members:
+        raise ValueError("O ZIP não contém arquivos CSV")
+    if MAX_UNCOMPRESSED_BYTES and total_size > MAX_UNCOMPRESSED_BYTES:
+        raise ValueError(
+            f"Conteúdo descompactado ({total_size} bytes) excede "
+            f"CNO_MAX_UNCOMPRESSED_BYTES ({MAX_UNCOMPRESSED_BYTES} bytes)"
+        )
+    return members
+
+
+def extract_member(
+    archive: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+    destination: Path,
+) -> None:
+    """Extrai uma entrada sem construir o CSV inteiro em memória."""
+    with archive.open(info, "r") as source, destination.open("wb") as output:
+        shutil.copyfileobj(source, output, length=COPY_CHUNK_SIZE)
+    if destination.stat().st_size != info.file_size:
+        raise IOError(f"Tamanho incorreto após extrair {info.filename}")
+
+
+def detect_csv_encoding(path: Path, sample_size: int = 1024 * 1024) -> str:
+    """Detecta os encodings nativos do leitor CSV do DuckDB."""
+    with path.open("rb") as source:
+        sample = source.read(sample_size)
+    if sample.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return "utf-16"
+    try:
+        sample.decode("utf-8-sig")
+        return "utf-8"
+    except UnicodeDecodeError:
+        return "latin-1"
+
+
+def _load_csv_to_staging(con, path: Path, staging_table: str, encoding: str) -> None:
+    def load(selected_encoding: str) -> None:
+        con.execute(
+            f"CREATE TABLE {qi(staging_table)} AS "
+            f"SELECT * FROM read_csv_auto({sql_string(path)}, "
+            f"all_varchar=true, encoding={sql_string(selected_encoding)})"
+        )
+
+    try:
+        load(encoding)
+    except Exception:
+        # A amostra pode ser UTF-8 válida mesmo quando um byte inválido só
+        # aparece no fim do arquivo. O segundo passe evita uma recodificação
+        # integral em Python e deixa o leitor vetorizado do DuckDB trabalhar.
+        con.execute(f"DROP TABLE IF EXISTS {qi(staging_table)}")
+        if encoding != "utf-8":
+            raise
+        LOG.warning("%s não é UTF-8 completo; tentando Latin-1", path.name)
+        load("latin-1")
+
+
+def extract_and_load_raw(threads: int = 8, url: str = CNO_URL) -> None:
+    """Baixa o ZIP, extrai CSVs em streaming e troca as tabelas atomicamente."""
+    if threads < 1:
+        raise ValueError("threads deve ser maior que zero")
+
+    staging_tables: list[tuple[str, str]] = []
+    connection = None
+    with tempfile.TemporaryDirectory(prefix="cno_") as temporary_directory:
+        workdir = Path(temporary_directory)
+        zip_path = workdir / "cno.zip"
+
+        LOG.info("Baixando dados do CNO")
+        downloaded = download_zip(url, zip_path)
+        LOG.info("ZIP recebido: %.1f MiB", downloaded / 2**20)
+
+        try:
+            connection = get_md_connection()
+            connection.execute(f"PRAGMA threads={int(threads)}")
+
+            with zipfile.ZipFile(zip_path) as archive:
+                members = csv_members(archive)
+                for index, (info, table) in enumerate(members, start=1):
+                    csv_path = workdir / f"{index:03d}_{table}.csv"
+                    staging = f"__cno_load_{table}_{uuid.uuid4().hex[:10]}"
+                    LOG.info(
+                        "Extraindo %s (%.1f MiB) -> %s",
+                        info.filename,
+                        info.file_size / 2**20,
+                        table,
+                    )
+                    extract_member(archive, info, csv_path)
+                    encoding = detect_csv_encoding(csv_path)
+                    LOG.info("Carregando %s com encoding %s", table, encoding)
+                    _load_csv_to_staging(connection, csv_path, staging, encoding)
+                    staging_tables.append((staging, table))
+                    csv_path.unlink()
+
+            # A troca só acontece depois que todos os CSVs foram lidos. DDL do
+            # DuckDB é transacional, portanto uma falha preserva as tabelas atuais.
+            connection.execute("BEGIN TRANSACTION")
+            try:
+                for staging, table in staging_tables:
+                    connection.execute(f"DROP TABLE IF EXISTS {qi(table)}")
+                    connection.execute(
+                        f"ALTER TABLE {qi(staging)} RENAME TO {qi(table)}"
+                    )
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+
+            staging_tables.clear()
+            LOG.info("Carga bruta do CNO concluída (%d tabela(s))", len(members))
+        finally:
+            if connection is not None:
+                for staging, _ in staging_tables:
+                    try:
+                        connection.execute(f"DROP TABLE IF EXISTS {qi(staging)}")
+                    except Exception:
+                        LOG.exception("Não foi possível remover staging %s", staging)
+                connection.close()
+
+
+def transform_data() -> None:
+    with closing(get_md_connection()) as con:
+        con.execute("""
+            CREATE OR REPLACE TABLE base_cno AS
+            SELECT c.*, a.* EXCLUDE (CNO, rn)
+            FROM cno c
+            LEFT JOIN (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY CNO ORDER BY rowid DESC) rn
+                FROM cno_areas
+            ) a ON c.CNO = a.CNO AND a.rn = 1
+            WHERE TRY_CAST(c."Data de registro" AS DATE) >= DATE '2020-01-01'
+        """)
+    LOG.info("base_cno criada/atualizada com registros desde 2020")
+
+
+def _backoff_seconds(attempt: int, retry_after: str | None) -> float:
+    if retry_after and retry_after.isdigit():
+        return min(float(retry_after), 60.0)
+    return min(2 ** (attempt - 1) + random.uniform(0, 0.5), 30.0)
+
+
+def get_cnpj_info(cnpj: str, max_retries: int) -> dict[str, Any]:
+    """Consulta a BrasilAPI com backoff e tratamento explícito dos status HTTP."""
+    if max_retries < 1:
+        raise ValueError("max_retries deve ser maior que zero")
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = _api_session().get(
+                BRASIL_API_URL.format(cnpj=cnpj), timeout=API_TIMEOUT
+            )
+            if response.status_code == 200:
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise ValueError("Resposta JSON não é um objeto")
+                return payload
+            if response.status_code == 404:
                 return {"_status": "nao_encontrado"}
-            if r.status_code == 429: # Rate limit
-                time.sleep(tentativa * 5)
-            else:
-                time.sleep(tentativa * 2)
-        except Exception:
-            time.sleep(tentativa * 2)
+            if response.status_code not in (429, 500, 502, 503, 504):
+                LOG.warning("BrasilAPI retornou HTTP %s para %s", response.status_code, cnpj)
+                return {"_status": "erro"}
+            retry_after = response.headers.get("Retry-After")
+        except (requests.RequestException, ValueError) as exc:
+            LOG.warning(
+                "Falha na consulta de %s (%d/%d): %s",
+                cnpj,
+                attempt,
+                max_retries,
+                exc,
+            )
+            retry_after = None
+
+        if attempt < max_retries:
+            time.sleep(_backoff_seconds(attempt, retry_after))
+
     return {"_status": "erro"}
 
-# =====================================================
-# DATA EXTRACTION & TRANSFORM (CNO)
-# =====================================================
-def extract_and_load_raw(threads: int = 8):
-    workdir = tempfile.mkdtemp(prefix="cno_")
-    zip_path = os.path.join(workdir, "cno.zip")
-    try:
-        print("⬇️ Baixando CNO...", flush=True)
-        r = requests.get(CNO_URL, stream=True, timeout=120)
-        r.raise_for_status()
-        with open(zip_path, "wb") as f:
-            for chunk in r.iter_content(4 * 1024 * 1024):
-                f.write(chunk)
 
-        con = get_md_connection()
-        con.execute("CREATE DATABASE IF NOT EXISTS cno")
-        con.execute("USE cno")
-        con.execute(f"PRAGMA threads={threads}")
-
-        with zipfile.ZipFile(zip_path) as z:
-            for file in z.namelist():
-                if not file.lower().endswith(".csv"): continue
-                table = os.path.basename(file).replace(".csv", "").replace("-", "_").lower()
-                print(f"📄 {file} → {table}")
-                
-                csv_path = os.path.join(workdir, file)
-                os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-                with z.open(file) as src:
-                    data = src.read()
-                
-                try:
-                    decoded = data.decode("utf-8")
-                except UnicodeDecodeError:
-                    decoded = data.decode("latin-1", errors="replace")
-                
-                with open(csv_path, "w", encoding="utf-8") as f:
-                    f.write(decoded)
-
-                con.execute(f"CREATE OR REPLACE TABLE {qi(table)} AS SELECT * FROM read_csv_auto('{csv_path}', ALL_VARCHAR=TRUE)")
-        con.close()
-        print("✅ CNO carregado", flush=True)
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
-
-def transform_data():
-    con = get_md_connection()
-    con.execute("USE cno")
-    
-    # Criamos a base filtrando pela data de registro
-    # Nota: Ajuste o nome da coluna "Data de registro" se no CSV original for diferente
-    con.execute("""
-        CREATE OR REPLACE TABLE base_cno AS
-        SELECT c.*, a.* EXCLUDE (CNO)
-        FROM cno c
-        LEFT JOIN (
-            SELECT *, ROW_NUMBER() OVER (PARTITION BY CNO ORDER BY rowid DESC) rn 
-            FROM cno_areas
-        ) a ON c.CNO = a.CNO AND a.rn = 1
-        WHERE CAST(c."Data de registro" AS DATE) >= '2020-01-01'
-    """)
-    
-    print(f"✅ base_cno criada/atualizada (Apenas registros >= 2020)", flush=True)
-    con.close()
-
-# =====================================================
-# CNPJ PROCESSING LOGIC
-# =====================================================
-def criar_tabelas_destino(con):
+def criar_tabelas_destino(con) -> None:
     con.execute(f"""
-        CREATE TABLE IF NOT EXISTS {TABLE_EMPRESA} (
-            cnpj VARCHAR PRIMARY KEY, 
-            razao_social VARCHAR, 
-            nome_fantasia VARCHAR, 
-            capital_social DOUBLE, 
-            logradouro VARCHAR, 
-            numero VARCHAR, 
-            bairro VARCHAR, 
-            municipio VARCHAR, 
-            uf VARCHAR, 
-            cep VARCHAR, 
-            situacao_cadastral VARCHAR, 
-            tipo_estabelecimento VARCHAR, 
-            porte VARCHAR, 
-            natureza_juridica VARCHAR, 
-            email VARCHAR, 
-            telefone_1 VARCHAR, 
-            telefone_2 VARCHAR, 
-            data_abertura DATE, 
-            data_consulta TIMESTAMP, 
+        CREATE TABLE IF NOT EXISTS {qualified_table(TABLE_EMPRESA)} (
+            cnpj VARCHAR PRIMARY KEY,
+            razao_social VARCHAR,
+            nome_fantasia VARCHAR,
+            capital_social DOUBLE,
+            logradouro VARCHAR,
+            numero VARCHAR,
+            bairro VARCHAR,
+            municipio VARCHAR,
+            uf VARCHAR,
+            cep VARCHAR,
+            situacao_cadastral VARCHAR,
+            tipo_estabelecimento VARCHAR,
+            porte VARCHAR,
+            natureza_juridica VARCHAR,
+            email VARCHAR,
+            telefone_1 VARCHAR,
+            telefone_2 VARCHAR,
+            data_abertura DATE,
+            data_consulta TIMESTAMP,
             status_consulta VARCHAR
         );
-        CREATE TABLE IF NOT EXISTS {TABLE_SOCIOS} (
-            cnpj VARCHAR, 
-            nome_socio VARCHAR, 
-            cnpj_cpf_do_socio VARCHAR, 
-            qualificacao_socio VARCHAR, 
-            data_entrada_sociedade DATE, 
+        CREATE TABLE IF NOT EXISTS {qualified_table(TABLE_SOCIOS)} (
+            cnpj VARCHAR,
+            nome_socio VARCHAR,
+            cnpj_cpf_do_socio VARCHAR,
+            qualificacao_socio VARCHAR,
+            data_entrada_sociedade DATE,
             faixa_etaria VARCHAR
         );
     """)
 
-def processar_cnpj(cnpj, max_retries):
+
+def processar_cnpj(cnpj: str, max_retries: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    cnpj = padronizar_cnpj(cnpj)
     info = get_cnpj_info(cnpj, max_retries)
-    
+    consulted_at = utc_now_naive()
+
     if "_status" in info:
-        return ({"cnpj": cnpj, "data_consulta": datetime.utcnow(), "status_consulta": info["_status"]}, [])
+        return (
+            {
+                "cnpj": cnpj,
+                "data_consulta": consulted_at,
+                "status_consulta": info["_status"],
+            },
+            [],
+        )
 
     empresa = {
-        "cnpj": cnpj, 
-        "razao_social": info.get("razao_social"), 
+        "cnpj": cnpj,
+        "razao_social": info.get("razao_social"),
         "nome_fantasia": info.get("nome_fantasia"),
-        "capital_social": float(info.get("capital_social", 0)),
-        "logradouro": info.get("logradouro"), 
-        "numero": info.get("numero"), 
+        "capital_social": parse_float(info.get("capital_social")),
+        "logradouro": info.get("logradouro"),
+        "numero": info.get("numero"),
         "bairro": info.get("bairro"),
-        "municipio": info.get("municipio"), 
-        "uf": info.get("uf"), 
+        "municipio": info.get("municipio"),
+        "uf": info.get("uf"),
         "cep": clean_digits(info.get("cep")),
         "situacao_cadastral": info.get("descricao_situacao_cadastral"),
         "tipo_estabelecimento": info.get("descricao_identificador_matriz_filial"),
-        "porte": info.get("porte"), 
-        "natureza_juridica": info.get("natureza_juridica"), 
+        "porte": info.get("porte"),
+        "natureza_juridica": info.get("natureza_juridica"),
         "email": info.get("email"),
-        "telefone_1": clean_digits(info.get("ddd_telefone_1")), 
+        "telefone_1": clean_digits(info.get("ddd_telefone_1")),
         "telefone_2": clean_digits(info.get("ddd_telefone_2")),
-        "data_abertura": pd.to_datetime(info.get("data_inicio_atividade")).date() if info.get("data_inicio_atividade") else None,
-        "data_consulta": datetime.utcnow(), 
-        "status_consulta": "ok"
+        "data_abertura": parse_date(info.get("data_inicio_atividade")),
+        "data_consulta": consulted_at,
+        "status_consulta": "ok",
     }
 
-    socios = []
-    for s in info.get("qsa", []):
-        socios.append({
-            "cnpj": cnpj, 
-            "nome_socio": s.get("nome_socio"), 
-            "cnpj_cpf_do_socio": s.get("cnpj_cpf_do_socio"),
-            "qualificacao_socio": s.get("qualificacao_socio"),
-            "data_entrada_sociedade": pd.to_datetime(s.get("data_entrada_sociedade")).date() if s.get("data_entrada_sociedade") else None,
-            "faixa_etaria": s.get("faixa_etaria")
-        })
-    return (empresa, socios)
+    socios = [
+        {
+            "cnpj": cnpj,
+            "nome_socio": socio.get("nome_socio"),
+            "cnpj_cpf_do_socio": socio.get("cnpj_cpf_do_socio"),
+            "qualificacao_socio": socio.get("qualificacao_socio"),
+            "data_entrada_sociedade": parse_date(socio.get("data_entrada_sociedade")),
+            "faixa_etaria": socio.get("faixa_etaria"),
+        }
+        for socio in (info.get("qsa") or [])
+        if isinstance(socio, dict)
+    ]
+    return empresa, socios
 
-def normalize_and_load(con, table_name, df, mode="IGNORE"):
-    """Trata tipos de dados e realiza a inserção conforme a restrição da tabela."""
-    if df.empty: return
 
-    # Forçar tipos de dados para evitar erros de conversão no DuckDB
-    for col in df.columns:
-        if "data_" in col:
-            df[col] = pd.to_datetime(df[col], errors='coerce')
-        elif col == "capital_social":
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0).astype(float)
+def _normalize_frame(table_name: str, frame: pd.DataFrame) -> pd.DataFrame:
+    columns = EMPRESA_COLUMNS if table_name == TABLE_EMPRESA else SOCIOS_COLUMNS
+    normalized = frame.reindex(columns=columns).copy()
+
+    date_columns = {"data_abertura", "data_consulta", "data_entrada_sociedade"}
+    for column in normalized.columns:
+        if column in date_columns:
+            normalized[column] = pd.to_datetime(normalized[column], errors="coerce")
+        elif column == "capital_social":
+            normalized[column] = pd.to_numeric(
+                normalized[column], errors="coerce"
+            ).fillna(0.0)
         else:
-            df[col] = df[col].astype(str).replace(['None', 'nan', '<NA>', 'NaN'], None)
+            normalized[column] = normalized[column].astype("string")
+    return normalized
 
-    temp_name = f"tmp_{table_name}_{int(time.time() * 1000)}" # Usando milissegundos para evitar conflito
-    con.register(temp_name, df)
-    
-    # Lógica de inserção
-    if table_name == TABLE_EMPRESA:
-        # A tabela de empresas TEM Primary Key, então podemos usar OR IGNORE / OR REPLACE
-        if mode == "IGNORE":
-            con.execute(f"INSERT OR IGNORE INTO cno.main.{table_name} SELECT * FROM {temp_name}")
-        elif mode == "REPLACE":
-            con.execute(f"INSERT OR REPLACE INTO cno.main.{table_name} SELECT * FROM {temp_name}")
-    else:
-        # A tabela de sócios NÃO TEM Primary Key. 
-        # Como já rodamos o DELETE antes no reprocessamento, um INSERT simples resolve.
-        con.execute(f"INSERT INTO cno.main.{table_name} SELECT * FROM {temp_name}")
-    
-    con.unregister(temp_name)
 
-# =====================================================
-# MAIN WORKFLOWS
-# =====================================================
-def dados_cnpj():
-    """Fetches and inserts new CNPJs that aren't in the database yet."""
-    con = get_md_connection()
-    criar_tabelas_destino(con)
-
-    df_faltantes = con.execute(f"""
-        SELECT DISTINCT regexp_replace("NI do responsável", '\\D', '', 'g') cnpj
-        FROM cno.base_cno
-        WHERE "NI do responsável" IS NOT NULL
-          AND cnpj NOT IN (SELECT cnpj FROM cno.main.{TABLE_EMPRESA})
-    """).df()
-
-    cnpjs = df_faltantes["cnpj"].dropna().tolist()
-    total = len(cnpjs)
-    print(f"🔎 {total} CNPJs novos para processar", flush=True)
-
-    for i in range(0, total, BATCH_SIZE):
-        batch = cnpjs[i : i + BATCH_SIZE]
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            resultados = list(executor.map(lambda c: processar_cnpj(padronizar_cnpj(c), MAX_TENTATIVAS_PADRAO), batch))
-
-        lista_e = [r[0] for r in resultados if r[0]]
-        lista_s = [s for r in resultados for s in r[1]]
-
-        if lista_e: normalize_and_load(con, TABLE_EMPRESA, pd.DataFrame(lista_e), "IGNORE")
-        if lista_s: normalize_and_load(con, TABLE_SOCIOS, pd.DataFrame(lista_s), "IGNORE")
-
-        print(f"⏳ Progresso: {min(i + BATCH_SIZE, total)}/{total}", flush=True)
-        time.sleep(SLEEP_SECONDS)
-    con.close()
-
-def reprocessar_erros():
-    """Identifica falhas anteriores e tenta novamente com prioridade (10 tentativas)."""
-    con = get_md_connection()
-    df_erros = con.execute(f"SELECT cnpj FROM cno.main.{TABLE_EMPRESA} WHERE status_consulta = 'erro'").df()
-    cnpjs_falhos = df_erros["cnpj"].tolist()
-    total = len(cnpjs_falhos)
-    
-    if total == 0:
-        print("✅ Nenhum CNPJ com status 'erro' para reprocessar.")
-        con.close()
+def normalize_and_load(con, table_name: str, frame: pd.DataFrame, mode: str = "IGNORE") -> None:
+    """Normaliza e insere explicitamente as colunas esperadas."""
+    if frame.empty:
         return
+    if table_name not in (TABLE_EMPRESA, TABLE_SOCIOS):
+        raise ValueError(f"Tabela de destino não permitida: {table_name}")
+    if mode not in ("IGNORE", "REPLACE"):
+        raise ValueError(f"Modo de inserção inválido: {mode}")
 
-    print(f"🔄 Reprocessando {total} erros com limite de 10 tentativas...", flush=True)
+    normalized = _normalize_frame(table_name, frame)
+    if table_name == TABLE_SOCIOS:
+        normalized = normalized.drop_duplicates()
+    temp_name = f"tmp_{table_name}_{uuid.uuid4().hex}"
+    columns = EMPRESA_COLUMNS if table_name == TABLE_EMPRESA else SOCIOS_COLUMNS
+    column_sql = ", ".join(qi(column) for column in columns)
+    insert = "INSERT"
+    if table_name == TABLE_EMPRESA:
+        insert += " OR IGNORE" if mode == "IGNORE" else " OR REPLACE"
 
-    for i in range(0, total, BATCH_SIZE):
-        batch = cnpjs_falhos[i : i + BATCH_SIZE]
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            resultados = list(executor.map(lambda c: processar_cnpj(c, 10), batch))
+    con.register(temp_name, normalized)
+    try:
+        con.execute(
+            f"{insert} INTO {qualified_table(table_name)} ({column_sql}) "
+            f"SELECT {column_sql} FROM {qi(temp_name)}"
+        )
+    finally:
+        con.unregister(temp_name)
 
-        lista_e = [r[0] for r in resultados if r[0]]
-        lista_s = [s for r in resultados for s in r[1]]
 
-        if lista_e:
-            normalize_and_load(con, TABLE_EMPRESA, pd.DataFrame(lista_e), "REPLACE")
+def _batches(items: list[str], size: int) -> Iterable[list[str]]:
+    if size < 1:
+        raise ValueError("BATCH_SIZE deve ser maior que zero")
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
 
-        if lista_s:
-            df_s = pd.DataFrame(lista_s)
-            # --- CORREÇÃO AQUI ---
-            # Pegamos os CNPJs únicos do lote e formatamos como uma string para o SQL: 'cnpj1', 'cnpj2'
-            cnpjs_unicos = df_s['cnpj'].unique().tolist()
-            cnpjs_sql = ", ".join([f"'{c}'" for c in cnpjs_unicos])
-            
-            # Deletamos os sócios antigos antes de inserir os novos para evitar duplicidade
-            con.execute(f"DELETE FROM cno.main.{TABLE_SOCIOS} WHERE cnpj IN ({cnpjs_sql})")
-            # ---------------------
-            
-            normalize_and_load(con, TABLE_SOCIOS, df_s, "IGNORE")
 
-        print(f"⏳ Reprocessamento: {min(i + BATCH_SIZE, total)}/{total}", flush=True)
-        time.sleep(SLEEP_SECONDS)
-    
-    con.close()
-    print("✅ Reprocessamento finalizado!")
+def _save_results(con, results, company_mode: str, replace_partners: bool) -> None:
+    companies = [result[0] for result in results]
+    partners = [partner for result in results for partner in result[1]]
+    successful_cnpjs = [
+        company["cnpj"]
+        for company in companies
+        if company.get("status_consulta") == "ok"
+    ]
 
-# =====================================================
-# EXECUTION
-# =====================================================
+    con.execute("BEGIN TRANSACTION")
+    try:
+        normalize_and_load(con, TABLE_EMPRESA, pd.DataFrame(companies), company_mode)
+
+        if replace_partners and successful_cnpjs:
+            ids_name = f"tmp_ids_{uuid.uuid4().hex}"
+            con.register(ids_name, pd.DataFrame({"cnpj": successful_cnpjs}))
+            try:
+                con.execute(
+                    f"DELETE FROM {qualified_table(TABLE_SOCIOS)} AS target "
+                    f"USING {qi(ids_name)} AS ids WHERE target.cnpj = ids.cnpj"
+                )
+            finally:
+                con.unregister(ids_name)
+
+        if partners:
+            normalize_and_load(con, TABLE_SOCIOS, pd.DataFrame(partners))
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+
+
+def _process_batches(
+    con,
+    cnpjs: list[str],
+    max_retries: int,
+    company_mode: str,
+    replace_partners: bool,
+    label: str,
+) -> None:
+    if MAX_WORKERS < 1:
+        raise ValueError("CNO_MAX_WORKERS deve ser maior que zero")
+    total = len(cnpjs)
+    processed = 0
+    worker = partial(processar_cnpj, max_retries=max_retries)
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="cnpj") as executor:
+        for batch in _batches(cnpjs, BATCH_SIZE):
+            results = list(executor.map(worker, batch))
+            _save_results(con, results, company_mode, replace_partners)
+            processed += len(batch)
+            LOG.info("%s: %d/%d", label, processed, total)
+            if processed < total and SLEEP_SECONDS > 0:
+                time.sleep(SLEEP_SECONDS)
+
+
+def dados_cnpj() -> None:
+    """Consulta e insere CNPJs ainda ausentes do banco."""
+    with closing(get_md_connection()) as con:
+        criar_tabelas_destino(con)
+        frame = con.execute(f"""
+            SELECT DISTINCT regexp_replace(base."NI do responsável", '\\D', '', 'g') cnpj
+            FROM cno.base_cno AS base
+            WHERE base."NI do responsável" IS NOT NULL
+              AND length(regexp_replace(base."NI do responsável", '\\D', '', 'g')) = 14
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM {qualified_table(TABLE_EMPRESA)} AS empresa
+                  WHERE empresa.cnpj = regexp_replace(
+                      base."NI do responsável", '\\D', '', 'g'
+                  )
+              )
+        """).df()
+        cnpjs = frame["cnpj"].dropna().astype(str).tolist()
+        LOG.info("%d CNPJ(s) novo(s) para processar", len(cnpjs))
+        if cnpjs:
+            _process_batches(
+                con,
+                cnpjs,
+                MAX_TENTATIVAS_PADRAO,
+                "IGNORE",
+                False,
+                "Novos CNPJs",
+            )
+
+
+def reprocessar_erros() -> None:
+    """Tenta novamente os CNPJs cujo último status foi ``erro``."""
+    with closing(get_md_connection()) as con:
+        criar_tabelas_destino(con)
+        frame = con.execute(
+            f"SELECT cnpj FROM {qualified_table(TABLE_EMPRESA)} "
+            "WHERE status_consulta = 'erro'"
+        ).df()
+        cnpjs = frame["cnpj"].dropna().astype(str).tolist()
+        if not cnpjs:
+            LOG.info("Nenhum CNPJ com status 'erro' para reprocessar")
+            return
+
+        LOG.info("Reprocessando %d erro(s)", len(cnpjs))
+        _process_batches(con, cnpjs, 10, "REPLACE", True, "Reprocessamento")
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="ETL do Cadastro Nacional de Obras")
+    parser.add_argument(
+        "stage",
+        nargs="?",
+        choices=("all", "extract", "transform", "cnpj", "retry"),
+        default="all",
+        help="etapa a executar (padrão: all)",
+    )
+    parser.add_argument("--threads", type=int, default=8, help="threads do DuckDB")
+    parser.add_argument("--url", default=CNO_URL, help="URL do ZIP do CNO")
+    parser.add_argument(
+        "--log-level",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        default=os.getenv("CNO_LOG_LEVEL", "INFO").upper(),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+    if args.stage in ("all", "extract"):
+        extract_and_load_raw(threads=args.threads, url=args.url)
+    if args.stage in ("all", "transform"):
+        transform_data()
+    if args.stage in ("all", "cnpj"):
+        dados_cnpj()
+    if args.stage in ("all", "retry"):
+        reprocessar_erros()
+
+
 if __name__ == "__main__":
-    # 1. Update Raw Data
-    extract_and_load_raw(threads=8)
-    transform_data()
-    
-    # 2. Process new entries
-    dados_cnpj()
-    
-    # 3. Retry previous failures (Rewrite data)
-    reprocessar_erros()
+    main()

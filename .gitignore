@@ -6,3 +6,7 @@ tmp_csvs/
 
 # CSVs grandes específicos (opcional)
 *.csv
+
+# Artefatos do Python
+__pycache__/
+*.py[cod]
